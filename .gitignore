@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment (contains secrets)
+.env
+
+# Testing
+.coverage
+htmlcov/
+.pytest_cache/
+
+# PR-Injector workspace (cloned repos, worktrees)
+.pri-workspace/
+
+# Generated benchmark data
+benchmark_dataset/
+
+# Extracted diff files (debugging artifacts)
+*.diff
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# OMC (oh-my-claudecode state)
+.omc/
+
+# Claude Code
+.claude/
