@@ -38,6 +38,7 @@ benchmark_dataset/
 
 # Logs
 *.log
+paper/
 
 # OS
 .DS_Store

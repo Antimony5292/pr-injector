@@ -1,88 +1,86 @@
 # PR-Injector
 
-**Dynamic Bug Injection via Historical PR Reversion for AI Coding Agent Evaluation**
+PR-Injector is a framework that transplants real historical bug-fix commits onto the latest healthy codebase via a multi-level reversion strategy, producing faithful benchmark instances without per-instance environments.
 
-PR-Injector is an automated defect injection framework designed for evaluating AI coding agents and code LLMs. Unlike traditional benchmarks that rely on stale historical snapshots, PR-Injector takes real historical bug-fix PRs and intelligently re-injects the original defects into the **latest, healthy `main` branch** — producing accurate golden patches and SWE-bench compatible evaluation instances.
+## Three-Stage Pipeline
 
-## Motivation
-
-Evaluating AI coding agents on real-world bug fixing is hard. Existing approaches have fundamental trade-offs:
-
-| | Static Snapshots (SWE-bench) | LLM Synthesis (SWE-smith) | **PR-Injector** |
-|---|---|---|---|
-| Runtime Environment | Stale dependencies, broken toolchains | Current codebase | **Current `main` branch** |
-| Bug Realism | High (real historical bugs) | Low (random mutations) | **High (real historical bugs)** |
-| Golden Patch | Yes | Often missing | **Yes (original PR diff)** |
-| Core Challenge | "Dependency hell" | Code that doesn't compile | **Cross-version context drift** |
-
-PR-Injector proposes a third paradigm: **cross-temporal intelligent reversion** — bringing real business-logic defects from historical PRs back into modern code through multi-level fallback strategies.
-
-## Multi-Level Injection Strategy
-
-When reverting a months-old PR onto the latest code, the main challenge is **context drift** — surrounding code has changed since the original fix. PR-Injector handles this with a 4-level fallback:
-
-### Level 1: Clean Git Revert
-The original fix context is unchanged. A simple `git revert` applies cleanly, producing a high-fidelity golden patch.
-
-### Level 2: AST Surgery
-Surrounding code has drifted (whitespace, renames, new statements), causing git conflicts. PR-Injector uses **tree-sitter** to parse both the current and pre-fix versions of the code, matches functions by name, and performs precise byte-level replacement — immune to line number shifts and formatting changes.
-
-### Level 3: LLM Semantic Injection
-The code has been significantly refactored. Physical matching fails entirely, but the core business logic still exists. A reasoning LLM (e.g., GPT-5, Claude) is given the original issue description, the original fix diff, and the current source code, then asked to re-introduce the same logical defect in the current architecture.
-
-### Level 4: Architecture Deprecated
-The underlying module has been removed or replaced entirely. PR-Injector detects this via file existence checks and discards the candidate — avoiding generation of meaningless "ghost code" bugs.
-
-## Pipeline Architecture
+Given a repository *R*, a healthy target revision *h*, and a historical bug-fix change *Δ*, PR-Injector constructs a buggy revision *h⁻* through a three-stage funnel:
 
 ```
-GitHub Repository
-       |
-       v
-+-- Stage 1: Miner --------+    Filter PRs by time decay, test presence,
-|   GitHub API -> Candidates |    patch size, and change frequency
-+---------------------------+
-       |
-       v
-+-- Stage 2: Reverter ------+    Level 1 (git revert) -> Level 2 (AST surgery)
-|   Git + tree-sitter        |    Isolated git worktrees for parallel safety
-+---------------------------+
-       |
-       v
-+-- Stage 3: Resolver ------+    Level 4 detection -> Level 3 (LLM injection)
-|   File checks + LLM call   |    Only invoked when Level 1 & 2 both fail
-+---------------------------+
-       |
-       v
-+-- Stage 4: Verifier ------+    Blast radius control:
-|   Test runner + validation  |    Target tests MUST fail, unrelated tests MUST pass
-+---------------------------+
-       |
-       v
-   benchmark.jsonl (SWE-bench compatible)
+  Input: (Repository R, Healthy Revision h, Historical Fix Δ)
+                          │
+                          ▼
+          ┌───────────────────────────────┐
+          │  Stage I: Pre-Screening       │
+          │  Deprecation-aware filtering  │
+          │  (Level 0)                    │
+          └───────────────┬───────────────┘
+                          │
+                          ▼
+          ┌───────────────────────────────┐
+          │  Stage II: Multi-Level        │
+          │  Historical Reversion         │
+          │                               │
+          │  Level 1: Exact Git Revert    │
+          │       │ (fails on drift)      │
+          │       ▼                       │
+          │  Level 2: AST Surgery         │
+          │       │ (fails on refactor)   │
+          │       ▼                       │
+          │  Level 3: LLM Revert          │
+          └───────────────┬───────────────┘
+                          │
+                          ▼
+          ┌───────────────────────────────┐
+          │  Stage III: Behavioral        │
+          │  Verification                 │
+          │                               │
+          │  • Pass-to-fail on target     │
+          │    tests                      │
+          │  • No-regression on unrelated │
+          │    tests                      │
+          └───────────────┬───────────────┘
+                          │
+                          ▼
+            benchmark.jsonl (SWE-bench compatible)
 ```
+
+### Stage I: Deprecation-Aware Pre-Screening
+
+Checks whether the repaired functionality still has an executable counterpart on the target revision. If the relevant source files have been deleted, target tests have disappeared, or the repaired module has been replaced, the candidate is discarded at Level 0.
+
+### Stage II: Multi-Level Historical Reversion
+
+Three recovery levels applied in cascade to handle increasing degrees of cross-version drift:
+
+**Level 1 — Exact Textual Reversion.** A direct `git revert --no-commit` of the historical fix on the target worktree. Succeeds when surrounding code is unchanged since the original fix.
+
+**Level 2 — AST-Guided Structural Reversion.** Uses tree-sitter to parse both the target file and the historical pre-fix file into syntax trees, matches function nodes by symbol identity, and performs bounded body-level replacement. Immune to whitespace changes, import reordering, comment edits, and nearby code insertions.
+
+**Level 3 — LLM Semantic Reversion.** Invokes a reasoning LLM with the current source code, the original fix diff, and optional PR context. The model infers the bug core and synthesizes an equivalent defect on the current architecture. Used only as a last resort.
+
+### Stage III: Behavioral Verification
+
+Every candidate injection must satisfy two conditions:
+- **Pass-to-fail**: target tests must fail on the injected revision but pass on the healthy revision.
+- **No-regression**: unrelated tests must continue to pass, constraining the blast radius of the injected bug.
 
 ## Installation
 
 Requires Python 3.10+ and Git.
 
 ```bash
-# Clone the repository
-git clone https://github.com/xqgao23/pr-injector.git
+git clone https://github.com/antimony5292/pr-injector.git
 cd pr-injector
 
 # Install with uv (recommended)
-uv pip install -e ".[languages,dev]"
+uv pip install -e ".[dev]"
 
 # Or with pip
-pip install -e ".[languages,dev]"
+pip install -e ".[dev]"
 ```
 
-The `languages` extra installs tree-sitter grammars for Python, JavaScript, TypeScript, Java, Go, and Rust.
-
 ## Configuration
-
-Copy the example environment file and fill in your credentials:
 
 ```bash
 cp .env.example .env
@@ -91,17 +89,14 @@ cp .env.example .env
 Key settings (all prefixed with `PRI_`):
 
 ```bash
-# Required: GitHub token for API access
 PRI_GITHUB_TOKEN=ghp_xxxxxxxxxxxx
 
 # LLM Provider: "azure" or "litellm"
 PRI_LLM_PROVIDER=azure
-
-# Azure OpenAI (requires `az login` for Azure AD auth)
 PRI_AZURE_ENDPOINT=https://your-resource.cognitiveservices.azure.com/
 PRI_AZURE_DEPLOYMENT=your-deployment-name
 
-# Or use litellm for other providers
+# Or use litellm
 # PRI_LLM_PROVIDER=litellm
 # PRI_LLM_MODEL=claude-sonnet-4-20250514
 # PRI_LLM_API_KEY=sk-xxxxxxxxxxxx
@@ -111,30 +106,18 @@ See [.env.example](.env.example) for all available options.
 
 ## Usage
 
-### Single PR Injection
-
-Inject a specific historical PR into the latest codebase:
-
 ```bash
-# Auto mode: tries Level 1 -> 2 -> 3 with fallback
+# Auto mode: Level 1 → Level 2 → Level 3 cascade
 pr-injector run pallets/flask 5797
 
-# Force a specific strategy
+# Force a specific reversion level
 pr-injector run pallets/flask 5799 --strategy llm
 
-# Skip verification (faster, for debugging)
+# Skip behavioral verification
 pr-injector run pallets/flask 5797 --no-verify
-```
 
-### Batch Mining
-
-Discover and process multiple candidate PRs from a repository:
-
-```bash
-pr-injector mine pallets/flask \
-  --since 2024-01-01 \
-  --require-tests \
-  --max-prs 50
+# Batch processing
+pr-injector mine pallets/flask --since 2024-01-01 --max-candidates 50
 ```
 
 ### Output Format
@@ -146,11 +129,10 @@ Results are written to `benchmark_dataset/benchmark.jsonl` in SWE-bench compatib
   "instance_id": "pallets-flask-pr-5797",
   "repo": "pallets/flask",
   "base_commit": "a3f9b2c1...",
-  "problem_statement": "Fix session context push ordering in redirects...",
+  "problem_statement": "Fix session context push ordering...",
   "injection_level": "Level_2_AST_Surgery",
-  "golden_patch": "diff --git a/src/flask/testing.py b/src/flask/testing.py\n...",
+  "golden_patch": "diff --git a/src/flask/testing.py ...",
   "test_patch": "",
-  "hints_text": "",
   "created_at": "2026-03-11T..."
 }
 ```
@@ -160,46 +142,27 @@ Results are written to `benchmark_dataset/benchmark.jsonl` in SWE-bench compatib
 ```
 pr-injector/
 ├── src/pr_injector/
-│   ├── cli/                # Typer CLI (run, mine commands)
-│   ├── pipeline/           # 4-stage funnel pipeline
-│   │   ├── miner.py        # Stage 1: PR discovery & filtering
-│   │   ├── reverter.py     # Stage 2: Level 1 (git) + Level 2 (AST)
-│   │   ├── resolver.py     # Stage 3: Level 4 detection + Level 3 (LLM)
-│   │   └── verifier.py     # Stage 4: Blast radius control
-│   ├── ast_engine/         # tree-sitter multi-language AST engine
+│   ├── cli/                # CLI interface
+│   ├── pipeline/
+│   │   ├── orchestrator.py # Three-stage pipeline coordination
+│   │   ├── reverter.py     # Stage II: Level 1 (git) + Level 2 (AST)
+│   │   ├── resolver.py     # Stage II: Level 3 (LLM semantic revert)
+│   │   └── verifier.py     # Stage III: Behavioral verification
+│   ├── ast_engine/         # tree-sitter AST parsing & surgery
 │   ├── llm/                # LLM client (Azure OpenAI / litellm)
 │   ├── core/               # Models, config, git ops, diff parsing
-│   └── output/             # SWE-bench compatible JSONL writer
-├── tests/                  # Unit and integration tests
-├── docs/design.md          # Technical design document (Chinese)
-├── pyproject.toml          # Project metadata and dependencies
-└── .env.example            # Environment variable template
+│   └── output/             # SWE-bench compatible JSONL serialization
+├── tests/
+└── pyproject.toml
 ```
-
-## Supported Languages (AST Surgery)
-
-Level 2 AST Surgery supports the following languages via tree-sitter:
-
-- Python
-- JavaScript / TypeScript
-- Java
-- Go
-- Rust
 
 ## Development
 
 ```bash
-# Run tests
-pytest
-
-# Run with coverage
-pytest --cov=pr_injector
-
-# Lint
-ruff check src/ tests/
-
-# Type check
-mypy src/
+pytest                        # Run tests
+pytest --cov=pr_injector      # Run with coverage
+ruff check src/ tests/        # Lint
+mypy src/                     # Type check
 ```
 
 ## License
