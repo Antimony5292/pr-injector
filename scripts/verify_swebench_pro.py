@@ -31,6 +31,34 @@ if sys.platform == "win32":
 PYTHON = sys.executable
 
 
+def _find_python() -> str:
+    """Find the best available Python interpreter (prefer 3.12+ for ansible)."""
+    for candidate in ("python3.12", "python3.13", "python3.14", "python3"):
+        p = shutil.which(candidate)
+        if p:
+            return p
+    return sys.executable
+
+
+def _create_venv(worktree: str) -> str:
+    """Create an isolated venv inside the worktree. Returns path to the venv python."""
+    venv_dir = os.path.join(worktree, ".venv")
+    python_bin = _find_python()
+    subprocess.run(
+        [python_bin, "-m", "venv", venv_dir],
+        cwd=worktree, capture_output=True, timeout=60,
+    )
+    venv_python = os.path.join(venv_dir, "bin", "python")
+    if not os.path.exists(venv_python):
+        venv_python = os.path.join(venv_dir, "Scripts", "python.exe")  # Windows
+    # Upgrade pip to avoid old-pip issues
+    subprocess.run(
+        [venv_python, "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"],
+        cwd=worktree, capture_output=True, timeout=120,
+    )
+    return venv_python
+
+
 def git(*args: str, cwd: str, timeout: int = 600) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["git"] + list(args),
@@ -43,11 +71,27 @@ def git_text(*args: str, cwd: str, timeout: int = 600) -> str:
     return r.stdout.decode(errors="replace")
 
 
-def run_pytest(cwd: str, test_files: list[str], timeout: int = 300) -> dict:
+def run_pytest(cwd: str, test_files: list[str], timeout: int = 300, python: str | None = None) -> dict:
     """Run pytest on specific test files and parse results."""
-    cmd = [PYTHON, "-m", "pytest", "-x", "--tb=short", "-q"] + test_files
+    py = python or PYTHON
+    base_cmd = [py, "-m", "pytest", "-x", "--tb=short", "-q",
+                "-p", "no:unraisableexception"] + test_files
+    # Use xvfb-run if available (needed for GUI frameworks like Qt)
+    if shutil.which("xvfb-run"):
+        cmd = ["xvfb-run", "-a"] + base_cmd
+    else:
+        cmd = base_cmd
+
+    # Set environment for headless Qt rendering
+    env = os.environ.copy()
+    env.update({
+        "QT_QPA_PLATFORM": "offscreen",
+        "QTWEBENGINE_DISABLE_SANDBOX": "1",
+        "QTWEBENGINE_CHROMIUM_FLAGS": "--disable-gpu --no-sandbox",
+        "QT_QUICK_BACKEND": "software",
+    })
     try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout)
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout, env=env)
         stdout = proc.stdout.decode(errors="replace")
         stderr = proc.stderr.decode(errors="replace")
         output = stdout + "\n" + stderr
@@ -146,56 +190,171 @@ def reverse_patch(patch: str) -> str:
     return "\n".join(ordered)
 
 
-def _install_project(worktree: str, repo: str, timeout: int = 300) -> bool:
-    """Install project and test dependencies in the worktree."""
+def _install_project(worktree: str, repo: str, timeout: int = 300, python: str | None = None,
+                     test_files: list[str] | None = None) -> bool:
+    """Install project and test dependencies in the worktree using isolated venv."""
     wt = Path(worktree)
-    pip_base = [PYTHON, "-m", "pip", "install", "-q", "--break-system-packages"]
+    py = python or PYTHON
+    pip_base = [py, "-m", "pip", "install", "-q"]
+
+    # Initialize git submodules if any
+    subprocess.run(
+        ["git", "submodule", "update", "--init", "--recursive"],
+        cwd=worktree, capture_output=True, timeout=120,
+    )
+
+    # Install vendored packages (e.g., vendor/infogami for openlibrary)
+    vendor_dir = wt / "vendor"
+    if vendor_dir.is_dir():
+        for sub in vendor_dir.iterdir():
+            if sub.is_dir() and (
+                (sub / "setup.py").exists() or (sub / "pyproject.toml").exists()
+            ):
+                subprocess.run(pip_base + ["-e", str(sub)], cwd=worktree,
+                               capture_output=True, timeout=timeout)
+        # Also add vendor dir to Python path via .pth file for non-installable packages
+        site_pkgs = subprocess.run(
+            [py, "-c", "import site; print(site.getsitepackages()[0])"],
+            capture_output=True, timeout=10,
+        )
+        if site_pkgs.returncode == 0:
+            sp = site_pkgs.stdout.decode().strip()
+            pth_file = Path(sp) / "vendor.pth"
+            if not pth_file.exists():
+                pth_file.write_text(str(vendor_dir) + "\n")
 
     # Always ensure pytest is available first
     subprocess.run(pip_base + ["pytest"], cwd=worktree, capture_output=True, timeout=120)
 
-    # Install requirement files
-    for req_file in ["requirements.txt", "test-requirements.txt", "requirements-tests.txt",
-                     "requirements/test.txt", "requirements/dev.txt"]:
+    # Install requirement files (including repo-specific patterns)
+    req_patterns = [
+        "requirements.txt", "test-requirements.txt", "requirements-tests.txt",
+        "requirements/test.txt", "requirements/dev.txt",
+        "requirements_test.txt", "requirements_dev.txt",
+    ]
+    for req_file in req_patterns:
         if (wt / req_file).exists():
-            subprocess.run(pip_base + ["-r", req_file], cwd=worktree,
-                           capture_output=True, timeout=timeout)
+            r = subprocess.run(pip_base + ["-r", req_file], cwd=worktree,
+                               capture_output=True, timeout=timeout)
+            if r.returncode != 0:
+                # Fallback: install line-by-line, skipping failures
+                _install_requirements_best_effort(pip_base, wt / req_file, worktree, timeout)
 
-    # Install the project itself with various extras
+    # Install the project itself
     if (wt / "pyproject.toml").exists() or (wt / "setup.py").exists():
-        # Try with test extras first
+        installed = False
         for extras in [".[test]", ".[dev]", ".[testing]", "."]:
             r = subprocess.run(pip_base + ["-e", extras], cwd=worktree,
                                capture_output=True, timeout=timeout)
             if r.returncode == 0:
+                installed = True
                 break
+            else:
+                stderr = r.stderr.decode(errors="replace") if r.stderr else ""
+                # If it's just "extra not found", try next; otherwise log
+                if "ERROR" in stderr and "extra" not in stderr.lower():
+                    print(f"        pip install -e {extras} failed: {stderr[-200:]}")
 
-    # Try to fix missing modules iteratively (up to 3 rounds)
-    for attempt in range(3):
+        if not installed:
+            print(f"        [WARN] Could not install project via pip install -e")
+
+    # Try to fix missing modules iteratively (up to 5 rounds)
+    # Use target test files for collection so conftest imports are detected
+    co_args = [py, "-m", "pytest", "--co", "-q"] + (test_files or [])
+    for attempt in range(5):
         r = subprocess.run(
-            [PYTHON, "-m", "pytest", "--co", "-q"],
-            cwd=worktree, capture_output=True, timeout=30,
+            co_args,
+            cwd=worktree, capture_output=True, timeout=60,
         )
         stderr = r.stderr.decode(errors="replace") if r.stderr else ""
         stdout = r.stdout.decode(errors="replace") if r.stdout else ""
         combined = stderr + stdout
 
         # Find missing pytest plugins
-        import re as _re
-        missing_plugins = _re.findall(r"pytest-\w+(?:-\w+)*", combined)
+        missing_plugins = re.findall(r"pytest-\w+(?:-\w+)*", combined)
+
+        # Detect unknown config options that indicate missing plugins
+        unknown_opts = re.findall(r"Unknown config option: (\w+)", combined)
+        CONFIG_TO_PLUGIN = {
+            "xvfb_colordepth": "pytest-xvfb",
+            "xvfb_width": "pytest-xvfb",
+            "xvfb_height": "pytest-xvfb",
+        }
+        for opt in unknown_opts:
+            if opt in CONFIG_TO_PLUGIN:
+                missing_plugins.append(CONFIG_TO_PLUGIN[opt])
 
         # Find missing modules from ImportError/ModuleNotFoundError
-        missing_modules = _re.findall(r"No module named '(\w+)'", combined)
+        missing_modules = re.findall(r"No module named '([\w.]+)'", combined)
 
-        to_install = list(set(missing_plugins + missing_modules))
+        # Filter out project's own modules (they should be installed via -e .)
+        repo_name = repo.split("/")[-1].replace("-", "_").lower()
+        missing_modules = [m for m in missing_modules if m.split(".")[0].lower() != repo_name]
+
+        # Map module names to pip package names (common mappings)
+        MODULE_TO_PIP = {
+            "pytest_mock": "pytest-mock",
+            "pytest_asyncio": "pytest-asyncio",
+            "pytest_cov": "pytest-cov",
+            "pytest_httpx": "pytest-httpx",
+            "yaml": "pyyaml",
+            "cv2": "opencv-python",
+            "PIL": "Pillow",
+            "bs4": "beautifulsoup4",
+            "attr": "attrs",
+            "dateutil": "python-dateutil",
+            "dotenv": "python-dotenv",
+            "gi": "PyGObject",
+            "web": "webpy",
+            "memcache": "python-memcached",
+            "psycopg2": "psycopg2-binary",
+        }
+        mapped_modules = []
+        for m in missing_modules:
+            base = m.split(".")[0]
+            # Special multi-level mappings
+            if m.startswith("PyQt6.QtWebEngine"):
+                mapped_modules.append("PyQt6-WebEngine")
+            elif m.startswith("PyQt5.QtWebEngine"):
+                mapped_modules.append("PyQtWebEngine")
+            else:
+                mapped_modules.append(MODULE_TO_PIP.get(base, base.replace("_", "-")))
+
+        to_install = list(set(missing_plugins + mapped_modules))
         if not to_install:
             break
 
         print(f"        Installing missing deps (round {attempt+1}): {to_install}")
-        subprocess.run(pip_base + to_install, cwd=worktree,
-                       capture_output=True, timeout=120)
+        r = subprocess.run(pip_base + to_install, cwd=worktree,
+                           capture_output=True, timeout=120)
+        if r.returncode != 0:
+            stderr = r.stderr.decode(errors="replace") if r.stderr else ""
+            # Try installing one by one, skip failures
+            for pkg in to_install:
+                subprocess.run(pip_base + [pkg], cwd=worktree,
+                               capture_output=True, timeout=60)
 
     return True
+
+
+def _install_requirements_best_effort(pip_base: list[str], req_path: Path, cwd: str, timeout: int) -> None:
+    """Install requirements file line-by-line, skipping failures."""
+    # Package substitutions for packages needing system deps
+    SUBSTITUTIONS = {
+        "psycopg2": "psycopg2-binary",
+    }
+    with open(req_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("#") or line.startswith("-r "):
+            continue
+        # Apply substitutions
+        pkg_name = re.split(r"[=<>!~\[]", line)[0].strip()
+        if pkg_name in SUBSTITUTIONS:
+            line = line.replace(pkg_name, SUBSTITUTIONS[pkg_name], 1)
+        # Try installing each line individually, including git+ deps
+        subprocess.run(pip_base + [line], cwd=cwd, capture_output=True, timeout=timeout)
 
 
 def verify_instance(
@@ -294,15 +453,17 @@ def verify_instance(
 
         print(f"  Target tests: {existing_tests}")
 
-        # Install project dependencies in worktree
-        print(f"  [0/3] Installing project dependencies...")
-        install_ok = _install_project(str(wt_path), repo, test_timeout)
+        # Create isolated venv for this worktree
+        print(f"  [0/3] Creating isolated venv & installing dependencies...")
+        venv_python = _create_venv(str(wt_path))
+        install_ok = _install_project(str(wt_path), repo, test_timeout,
+                                      python=venv_python, test_files=existing_tests)
         if not install_ok:
             print(f"  [WARN] Dependency install may have issues, proceeding anyway")
 
         # ── Step 1: Healthy check (target tests should PASS) ──
         print(f"  [1/3] Healthy check: running target tests on clean HEAD...")
-        healthy_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout)
+        healthy_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout, python=venv_python)
         healthy_pass = healthy_result["returncode"] == 0
         print(f"        rc={healthy_result['returncode']} passed={healthy_result['passed']} "
               f"failed={healthy_result['failed']} → {'PASS' if healthy_pass else 'FAIL'}")
@@ -394,7 +555,7 @@ def verify_instance(
 
         # ── Step 3: Pass-to-fail check (target tests should FAIL) ──
         print(f"  [3/3] P2F check: running target tests on buggy revision...")
-        buggy_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout)
+        buggy_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout, python=venv_python)
         target_failed = buggy_result["returncode"] != 0
         print(f"        rc={buggy_result['returncode']} passed={buggy_result['passed']} "
               f"failed={buggy_result['failed']} → {'FAIL (good!)' if target_failed else 'PASS (bad!)'}")
