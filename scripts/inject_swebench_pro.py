@@ -32,6 +32,22 @@ if sys.platform == "win32":
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
 
+class _Tee:
+    """Write to multiple streams simultaneously."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for s in self.streams:
+            s.write(text)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 PYTHON = sys.executable
@@ -720,8 +736,10 @@ def main():
     parser.add_argument("--output", "-o", default="experiments/swebench_pro/injection_results.jsonl")
     parser.add_argument("--timeout", "-t", type=int, default=300)
     parser.add_argument("--skip-verify", action="store_true")
-    parser.add_argument("--enable-l3", action="store_true",
-                        help="Enable Level 3 LLM injection for L1+L2 failures")
+    parser.add_argument("--enable-l3", action="store_true", default=True,
+                        help="Enable Level 3 LLM injection for L1+L2 failures (default: enabled)")
+    parser.add_argument("--no-l3", action="store_true",
+                        help="Disable Level 3 LLM injection (use L1+L2 only)")
     parser.add_argument("--filter", "-f", type=str, default=None)
     parser.add_argument("--max", "-n", type=int, default=None)
     parser.add_argument("--repos-dir", default=".pri-workspace/repos")
@@ -732,6 +750,13 @@ def main():
     if not input_path.exists():
         print(f"File not found: {input_path}")
         sys.exit(1)
+
+    # Setup log file (tee stdout to file)
+    output_path = Path(args.output)
+    log_path = output_path.parent / (output_path.stem.replace("_results", "") + ".log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
 
     repos_dir = Path(args.repos_dir)
     worktrees_dir = Path(args.worktrees_dir)
@@ -766,7 +791,7 @@ def main():
         try:
             result = inject_instance(
                 inst, repos_dir, worktrees_dir, args.timeout, args.skip_verify,
-                enable_l3=args.enable_l3,
+                enable_l3=args.enable_l3 and not args.no_l3,
             )
         except Exception as e:
             print(f"  [ERROR] {e}")
@@ -824,6 +849,7 @@ def main():
         v_total = stats["verified_ok"] + stats["verified_fail"]
         print(f"  Verified OK         : {stats['verified_ok']}/{v_total} ({stats['verified_ok']/v_total*100:.1f}%)")
     print(f"\n  Results saved to: {args.output}")
+    print(f"  Log saved to: {log_path}")
 
 
 if __name__ == "__main__":

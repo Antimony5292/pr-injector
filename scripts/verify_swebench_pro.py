@@ -28,6 +28,23 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
     os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 
+
+class _Tee:
+    """Write to multiple streams simultaneously."""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    def write(self, text):
+        for s in self.streams:
+            s.write(text)
+            s.flush()
+
+    def flush(self):
+        for s in self.streams:
+            s.flush()
+
+
 PYTHON = sys.executable
 
 
@@ -636,6 +653,13 @@ def main():
     parser.add_argument("--worktrees-dir", default=".pri-workspace/worktrees")
     args = parser.parse_args()
 
+    # Setup log file (tee stdout to file)
+    output_path = Path(args.output)
+    log_path = output_path.parent / (output_path.stem.replace("_results", "") + ".log")
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_path, "w", encoding="utf-8")
+    sys.stdout = _Tee(sys.__stdout__, log_file)
+
     # Load data
     with open(args.injection_results, encoding="utf-8") as f:
         injections = [json.loads(l) for l in f if l.strip()]
@@ -710,6 +734,7 @@ def main():
     print(f"  P2F failed            : {stats['p2f_failed']}")
     print(f"  Healthy already fail  : {stats['healthy_already_fail']}")
     print(f"\n  Results saved to: {args.output}")
+    print(f"  Log saved to: {log_path}")
 
 
 if __name__ == "__main__":

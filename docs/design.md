@@ -203,6 +203,8 @@ PR-Injector 是一个面向 **AI 编码智能体评估** 的新一代自动化�
 
 #### Level 3: LLM 语义注入 (Semantic Injection)
 
+> **默认启用**: Level 3 LLM 注入在 AUTO 策略下默认启用。当 Level 1 和 Level 2 均失败时，系统会自动尝试 LLM 语义注入。可通过 `--no-l3` 命令行参数禁用。
+
 ```
 状态: 代码结构已发生较大重构，物理级匹配完全失效
 工具: litellm → 任意高阶推理模型
@@ -315,7 +317,7 @@ class InjectionLevel(str, Enum):
 
 class InjectionStrategy(str, Enum):
     """用户可选的注入策略（CLI 参数）"""
-    AUTO     = "auto"     # 依次尝试 Git → AST → LLM
+    AUTO     = "auto"     # 依次尝试 Git → AST → LLM（L3 默认启用，可用 --no-l3 禁用）
     GIT_ONLY = "git"      # 仅尝试 Level 1
     AST_ONLY = "ast"      # 仅尝试 Level 2
     LLM_ONLY = "llm"      # 仅尝试 Level 3
@@ -963,6 +965,7 @@ PRI_LLM_API_KEY=sk-ant-xxxxxxxxxxxx    # API 密钥（或通过 ANTHROPIC_API_KE
 PRI_LLM_TEMPERATURE=0.2               # 生成温度（低温保证确定性）
 PRI_LLM_MAX_TOKENS=4096               # 最大输出 tokens
 PRI_LLM_MAX_RETRIES=3                 # API 调用最大重试次数
+# 注意: Level 3 LLM 注入默认启用，使用 --no-l3 命令行参数可禁用
 
 # 流水线
 PRI_WORKSPACE_DIR=.pri-workspace      # 工作区根目录（存放克隆仓库和 worktrees）
@@ -1148,8 +1151,8 @@ pr-injector/
 │   └── autopilot/
 │       └── spec.md                        # 项目规格说明
 │
-├── main.py                                # 直接运行入口（开发调试用）
-├── pyproject.toml                         # 项目配置（hatch 构建系统）
+├── main.py                                # 直接运行入口（uv run main.py）
+├── pyproject.toml                         # 项目配置（hatch 构建系统，uv 管理依赖）
 ├── .env.example                           # 环境变量示例
 ├── .gitignore
 └── README.md                              # 项目文档（中文）
@@ -1160,7 +1163,7 @@ pr-injector/
 ## 附录：关键数据流示意
 
 ```
-用户输入: python main.py run --repo pallets/flask --pr 5001
+用户输入: uv run main.py run --repo pallets/flask --pr 5001
                 │
                 ▼
         CLI (typer) 解析参数
