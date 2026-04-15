@@ -29,7 +29,7 @@ htmlcov/
 
 # PR-Injector workspace (cloned repos, worktrees)
 .pri-workspace/
-
+.product-workspace/
 # Generated benchmark data
 benchmark_dataset/
 
