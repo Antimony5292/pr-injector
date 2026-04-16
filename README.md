@@ -74,7 +74,7 @@ git clone https://github.com/antimony5292/pr-injector.git
 cd pr-injector
 
 # Install with uv (recommended)
-uv pip install -e ".[dev]"
+uv sync
 
 # Or with pip
 pip install -e ".[dev]"

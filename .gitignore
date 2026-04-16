@@ -49,3 +49,8 @@ Thumbs.db
 
 # Claude Code
 .claude/
+
+
+experiments/swebench_pro/sampled_35.jsonl
+
+docs/xingliang_docs/
