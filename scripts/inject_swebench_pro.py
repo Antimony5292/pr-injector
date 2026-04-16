@@ -5,12 +5,13 @@ For each instance in the sampled JSONL:
   2. Attempt Level 1: reverse-apply the patch via `git apply -R`
   3. If L1 fails, attempt Level 2: AST surgery (match functions from base_commit)
   4. If L2 fails, attempt Level 3: LLM semantic injection
-  5. If injection succeeds, verify: target tests should FAIL, unrelated tests should PASS
-  6. Record results to output JSONL
+  5. Record results to output JSONL
+
+Verification is handled separately by verify_swebench_pro.py.
 
 Usage:
-    python scripts/inject_swebench_pro.py [--input FILE] [--output FILE]
-                                           [--timeout 300] [--skip-verify]
+    uv run scripts/inject_swebench_pro.py [--input FILE] [--output FILE]
+                                           [--timeout 300]
                                            [--filter INSTANCE_ID]
                                            [--max N]
 """
@@ -149,40 +150,6 @@ def reverse_patch(patch: str) -> str:
     flush()
     return "\n".join(ordered)
 
-
-def run_pytest(cwd: str, test_files: list[str], timeout: int = 300) -> dict:
-    """Run pytest on specific test files."""
-    cmd = [PYTHON, "-m", "pytest", "-x", "--tb=short", "-q"] + test_files
-    try:
-        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout)
-        stdout = proc.stdout.decode(errors="replace")
-        stderr = proc.stderr.decode(errors="replace")
-        output = stdout + "\n" + stderr
-
-        passed, failed, errors = 0, 0, 0
-        m = re.search(r"(\d+) passed", output)
-        if m:
-            passed = int(m.group(1))
-        m = re.search(r"(\d+) failed", output)
-        if m:
-            failed = int(m.group(1))
-        m = re.search(r"(\d+) error", output)
-        if m:
-            errors = int(m.group(1))
-
-        return {
-            "returncode": proc.returncode,
-            "passed": passed,
-            "failed": failed + errors,
-            "total": passed + failed + errors,
-            "output_tail": output[-1500:],
-        }
-    except subprocess.TimeoutExpired:
-        return {"returncode": -1, "passed": 0, "failed": 0, "total": 0,
-                "output_tail": "TIMEOUT"}
-    except Exception as e:
-        return {"returncode": -1, "passed": 0, "failed": 0, "total": 0,
-                "output_tail": str(e)}
 
 
 # ── Level 1: Direct reverse apply ────────────────────────────────────────────
@@ -540,7 +507,6 @@ def inject_instance(
     repos_dir: Path,
     worktrees_dir: Path,
     test_timeout: int,
-    skip_verify: bool,
     enable_l3: bool = False,
 ) -> dict:
     """Attempt injection for a single SWE-bench Pro instance."""
@@ -571,7 +537,6 @@ def inject_instance(
         "injection_level": None,
         "success": False,
         "failure_reason": None,
-        "verification": None,
     }
 
     # 1. Clone/update repo
@@ -690,33 +655,6 @@ def inject_instance(
                     result["failure_reason"] = l2_result
                     result["injection_level"] = "Level_3_Needed"
 
-        # 5. Verification
-        if result["success"] and not skip_verify and target_tests:
-            print(f"  [Verify] Running target tests ({target_tests})...")
-            # Filter to existing test files
-            existing_tests = [t for t in target_tests if (wt_path / t).exists()]
-            if not existing_tests:
-                print(f"  [Verify] No target test files exist on healthy revision")
-                result["verification"] = {"skip_reason": "test_files_missing"}
-            else:
-                test_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout)
-                target_failed = test_result["returncode"] != 0
-
-                result["verification"] = {
-                    "target_tests_failed": target_failed,
-                    "target_passed": test_result["passed"],
-                    "target_failures": test_result["failed"],
-                    "target_total": test_result["total"],
-                }
-
-                if target_failed:
-                    print(f"  [Verify] Target tests FAIL (good!) - "
-                          f"passed={test_result['passed']} failed={test_result['failed']}")
-                else:
-                    print(f"  [Verify] Target tests PASS (bad - injection didn't break them)")
-                    result["success"] = False
-                    result["failure_reason"] = "verification_failed_tests_still_pass"
-
         status = "PASS" if result["success"] else "FAIL"
         level = result["injection_level"] or "none"
         print(f"\n  [{status}] {short_id} ({level})")
@@ -735,7 +673,6 @@ def main():
     parser.add_argument("--input", "-i", default="experiments/swebench_pro/sampled_35.jsonl")
     parser.add_argument("--output", "-o", default="experiments/swebench_pro/injection_results.jsonl")
     parser.add_argument("--timeout", "-t", type=int, default=300)
-    parser.add_argument("--skip-verify", action="store_true")
     parser.add_argument("--enable-l3", action="store_true", default=True,
                         help="Enable Level 3 LLM injection for L1+L2 failures (default: enabled)")
     parser.add_argument("--no-l3", action="store_true",
@@ -781,8 +718,7 @@ def main():
     # Run injection
     results = []
     stats = {"total": 0, "l1_success": 0, "l2_success": 0, "l3_success": 0,
-             "l3_failed": 0, "l3_needed": 0,
-             "verified_ok": 0, "verified_fail": 0, "errors": 0}
+             "l3_failed": 0, "l3_needed": 0, "errors": 0}
 
     for i, inst in enumerate(instances, 1):
         print(f"\n[{i}/{len(instances)}]", end="")
@@ -790,7 +726,7 @@ def main():
 
         try:
             result = inject_instance(
-                inst, repos_dir, worktrees_dir, args.timeout, args.skip_verify,
+                inst, repos_dir, worktrees_dir, args.timeout,
                 enable_l3=args.enable_l3 and not args.no_l3,
             )
         except Exception as e:
@@ -816,12 +752,6 @@ def main():
         elif level == "Level_3_Needed":
             stats["l3_needed"] += 1
 
-        v = result.get("verification", {})
-        if v and v.get("target_tests_failed"):
-            stats["verified_ok"] += 1
-        elif v and not v.get("skip_reason"):
-            stats["verified_fail"] += 1
-
         # Don't write large diffs to results
         result.pop("injected_diff", None)
         results.append(result)
@@ -845,9 +775,6 @@ def main():
     print(f"  Level 3 needed      : {stats['l3_needed']}")
     print(f"  Errors              : {stats['errors']}")
     print(f"  Injection rate      : {l_success/t*100:.1f}%")
-    if stats["verified_ok"] + stats["verified_fail"] > 0:
-        v_total = stats["verified_ok"] + stats["verified_fail"]
-        print(f"  Verified OK         : {stats['verified_ok']}/{v_total} ({stats['verified_ok']/v_total*100:.1f}%)")
     print(f"\n  Results saved to: {args.output}")
     print(f"  Log saved to: {log_path}")
 
