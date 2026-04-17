@@ -142,71 +142,6 @@ def run_pytest(cwd: str, test_files: list[str], timeout: int = 300, python: str 
                 "failed_tests": [], "output_tail": str(e)}
 
 
-def extract_source_files_from_patch(patch: str) -> list[str]:
-    """Extract non-test source files from a patch."""
-    test_pats = [re.compile(r"test[_/]"), re.compile(r"[_/]test\."), re.compile(r"tests[_/]")]
-    files = []
-    for line in patch.splitlines():
-        m = re.match(r"^diff --git a/(\S+) b/(\S+)", line)
-        if m:
-            path = m.group(2)
-            if not any(p.search(path.lower()) for p in test_pats):
-                files.append(path)
-    return list(dict.fromkeys(files))
-
-
-def reverse_patch(patch: str) -> str:
-    """Reverse a unified diff for injection."""
-    lines = patch.split("\n")
-    result = []
-    for line in lines:
-        if line.startswith("new file mode"):
-            result.append(line.replace("new file mode", "deleted file mode"))
-        elif line.startswith("deleted file mode"):
-            result.append(line.replace("deleted file mode", "new file mode"))
-        elif line.startswith("--- a/"):
-            result.append(line.replace("--- a/", "+++ b/").replace("+++ b/", "+++ b/", 1))
-        elif line.startswith("+++ b/"):
-            result.append(line.replace("+++ b/", "--- a/").replace("--- a/", "--- a/", 1))
-        elif line.startswith("--- /dev/null"):
-            result.append("+++ /dev/null")
-        elif line.startswith("+++ /dev/null"):
-            result.append("--- /dev/null")
-        elif line.startswith("@@"):
-            m2 = re.match(r"@@ -(\d+(?:,\d+)?) \+(\d+(?:,\d+)?) @@(.*)", line)
-            if m2:
-                result.append(f"@@ -{m2.group(2)} +{m2.group(1)} @@{m2.group(3)}")
-            else:
-                result.append(line)
-        elif line.startswith("+") and not line.startswith("+++"):
-            result.append("-" + line[1:])
-        elif line.startswith("-") and not line.startswith("---"):
-            result.append("+" + line[1:])
-        else:
-            result.append(line)
-
-    # Reorder: - before + in each group
-    ordered = []
-    plus_buf, minus_buf = [], []
-
-    def flush():
-        ordered.extend(minus_buf)
-        ordered.extend(plus_buf)
-        minus_buf.clear()
-        plus_buf.clear()
-
-    for line in result:
-        if line.startswith("+") and not line.startswith("+++"):
-            plus_buf.append(line)
-        elif line.startswith("-") and not line.startswith("---"):
-            minus_buf.append(line)
-        else:
-            flush()
-            ordered.append(line)
-    flush()
-    return "\n".join(ordered)
-
-
 def _install_project(worktree: str, repo: str, timeout: int = 300, python: str | None = None,
                      test_files: list[str] | None = None) -> bool:
     """Install project and test dependencies in the worktree using isolated venv."""
@@ -489,82 +424,31 @@ def verify_instance(
             print(f"  [WARN] Target tests already fail on healthy HEAD!")
             print(f"         {healthy_result['output_tail'][-300:]}")
 
-        # ── Step 2: Inject bug (apply reverse patch via AST/git) ──
-        print(f"  [2/3] Injecting bug...")
+        # ── Step 2: Apply saved diff ──
+        print(f"  [2/3] Applying saved diff...")
+        diff_rel_path = injection_result.get("injected_diff", "")
 
-        # We need to recreate the injection. Use the same method as the original run.
-        # For L2 (AST Surgery): re-run AST surgery using base_commit
-        base_commit = original_data.get("base_commit", "")
-        import ast as pyast
+        if not diff_rel_path:
+            print(f"  [FAIL] No injected_diff path in result")
+            result["verification"] = {"status": "diff_file_missing"}
+            return result
 
-        source_files = extract_source_files_from_patch(patch)
-        injected = False
+        project_root = Path(__file__).resolve().parent.parent
+        diff_path = project_root / diff_rel_path
 
-        if level == "Level_1_Clean_Revert":
-            # Try git apply -R
-            proc = subprocess.run(
-                ["git", "apply", "-R"],
-                cwd=str(wt_path), input=patch.encode(),
-                capture_output=True, timeout=30,
-            )
-            if proc.returncode == 0:
-                injected = True
-            else:
-                # Fallback: manual reverse
-                rev = reverse_patch(patch)
-                proc = subprocess.run(
-                    ["git", "apply"],
-                    cwd=str(wt_path), input=rev.encode(),
-                    capture_output=True, timeout=30,
-                )
-                injected = proc.returncode == 0
+        if not diff_path.exists():
+            print(f"  [FAIL] Diff file not found: {diff_path}")
+            result["verification"] = {"status": "diff_file_missing"}
+            return result
 
-        elif level == "Level_2_AST_Surgery":
-            # Re-run AST surgery
-            for filepath in source_files:
-                target_path = wt_path / filepath
-                if not target_path.exists():
-                    continue
-
-                try:
-                    prefix_content = git_text("show", f"{base_commit}:{filepath}",
-                                              cwd=str(repo_dir), timeout=30)
-                except Exception:
-                    continue
-
-                if not prefix_content.strip():
-                    continue
-
-                current_content = target_path.read_text(encoding="utf-8", errors="replace")
-
-                try:
-                    prefix_tree = pyast.parse(prefix_content)
-                    current_tree = pyast.parse(current_content)
-                except SyntaxError:
-                    continue
-
-                # Extract functions
-                prefix_funcs = _extract_functions(prefix_content, prefix_tree)
-                current_funcs = _extract_functions(current_content, current_tree)
-
-                new_content = current_content
-                replaced = False
-                for name, prefix_src in prefix_funcs.items():
-                    if name in current_funcs and current_funcs[name] != prefix_src:
-                        new_content = new_content.replace(current_funcs[name], prefix_src)
-                        replaced = True
-
-                if replaced:
-                    try:
-                        pyast.parse(new_content)
-                    except SyntaxError:
-                        continue
-                    target_path.write_text(new_content, encoding="utf-8")
-                    injected = True
-
-        if not injected:
-            print(f"  [FAIL] Could not re-inject bug")
-            result["verification"] = {"status": "injection_replay_failed"}
+        proc = subprocess.run(
+            ["git", "apply", str(diff_path)],
+            cwd=str(wt_path),
+            capture_output=True, timeout=30,
+        )
+        if proc.returncode != 0:
+            print(f"  [FAIL] git apply failed: {proc.stderr.decode()[:200]}")
+            result["verification"] = {"status": "diff_apply_failed"}
             return result
 
         diff_size = len(git_text("diff", cwd=str(wt_path)))
@@ -627,18 +511,6 @@ def verify_instance(
     finally:
         git("worktree", "remove", "--force", str(wt_path), cwd=str(repo_dir))
         git("branch", "-D", branch, cwd=str(repo_dir))
-
-
-def _extract_functions(source: str, tree) -> dict[str, str]:
-    import ast as pyast
-    lines = source.splitlines(keepends=True)
-    funcs = {}
-    for node in pyast.walk(tree):
-        if isinstance(node, (pyast.FunctionDef, pyast.AsyncFunctionDef)):
-            start = node.lineno - 1
-            end = node.end_lineno if hasattr(node, "end_lineno") and node.end_lineno else start + 1
-            funcs[node.name] = "".join(lines[start:end])
-    return funcs
 
 
 def main():

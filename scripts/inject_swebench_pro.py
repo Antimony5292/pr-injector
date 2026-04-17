@@ -752,8 +752,16 @@ def main():
         elif level == "Level_3_Needed":
             stats["l3_needed"] += 1
 
-        # Don't write large diffs to results
-        result.pop("injected_diff", None)
+        # Save diff to file, store relative path in result
+        diff_content = result.pop("injected_diff", None)
+        if diff_content and result.get("success"):
+            diff_dir = Path(args.output).parent / "diffs"
+            diff_dir.mkdir(parents=True, exist_ok=True)
+            diff_path = diff_dir / f"{result['instance_id']}.diff"
+            diff_path.write_text(diff_content, encoding="utf-8")
+            # Store path relative to project root
+            project_root = Path(__file__).resolve().parent.parent
+            result["injected_diff"] = str(diff_path.resolve().relative_to(project_root))
         results.append(result)
 
         # Incremental save
