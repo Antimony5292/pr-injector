@@ -113,16 +113,19 @@ PR-Injector 是一个面向 **AI 编码智能体评估** 的新一代自动化�
 │                      STAGE 4: VERIFIER（验证器）                         │
 │                                                                          │
 │  ┌───────────────────────────────────────────────────────────────────┐  │
-│  │  爆炸半径控制（Blast Radius Control）                               │  │
+│  │  验证流程（Verification Pipeline）                                  │  │
 │  │                                                                   │  │
-│  │  Step 1: 运行目标测试（来自原始 PR 的 test_files）                  │  │
+│  │  Step 1: 健康检查 — 在干净 HEAD 上运行目标测试                      │  │
+│  │          ✅ 必须 PASS → 确认测试本身可用                            │  │
+│  │                                                                   │  │
+│  │  Step 2: 应用保存的 diff 文件（inject 阶段产出）                    │  │
+│  │          git apply <saved_diff> → 注入缺陷                         │  │
+│  │                                                                   │  │
+│  │  Step 3: P2F 检查 — 运行目标测试                                   │  │
 │  │          ✅ 必须 FAIL → 证明缺陷注入生效                            │  │
 │  │                                                                   │  │
-│  │  Step 2: 运行全量测试套件                                          │  │
-│  │          ✅ 无关测试失败率 ≤ blast_radius_threshold (10%)          │  │
-│  │                                                                   │  │
-│  │  ✅ 双重验证通过 → VerificationResult(blast_radius_ok=True)        │  │
-│  │  ❌ 爆炸半径失控 → 样本作废                                         │  │
+│  │  ✅ Step1 PASS + Step3 FAIL → pass_to_fail 确认                    │  │
+│  │  ❌ 任一步骤失败 → 样本标记为验证失败                                │  │
 │  └───────────────────────────────────────────────────────────────────┘  │
 │                                                                          │
 └────────────────────────────────────────┼────────────────────────────────┘
@@ -202,6 +205,8 @@ PR-Injector 是一个面向 **AI 编码智能体评估** 的新一代自动化�
 ```
 
 #### Level 3: LLM 语义注入 (Semantic Injection)
+
+> **默认启用**: Level 3 LLM 注入在 AUTO 策略下默认启用。当 Level 1 和 Level 2 均失败时，系统会自动尝试 LLM 语义注入。可通过 `--no-l3` 命令行参数禁用。
 
 ```
 状态: 代码结构已发生较大重构，物理级匹配完全失效
@@ -315,7 +320,7 @@ class InjectionLevel(str, Enum):
 
 class InjectionStrategy(str, Enum):
     """用户可选的注入策略（CLI 参数）"""
-    AUTO     = "auto"     # 依次尝试 Git → AST → LLM
+    AUTO     = "auto"     # 依次尝试 Git → AST → LLM（L3 默认启用，可用 --no-l3 禁用）
     GIT_ONLY = "git"      # 仅尝试 Level 1
     AST_ONLY = "ast"      # 仅尝试 Level 2
     LLM_ONLY = "llm"      # 仅尝试 Level 3
@@ -556,21 +561,39 @@ if not test_files_exist or not source_files_exist:
 
 **位置**: `src/pr_injector/pipeline/verifier.py`
 
-#### 6.4.1 爆炸半径控制机制
+#### 6.4.1 验证流程
 
-**核心不变式（Invariant）**：
-
-> 注入缺陷后，目标测试（来自原始 PR 的测试文件）**必须失败**，而无关测试的失败率**必须低于阈值**。
+验证器从 inject 阶段保存的 diff 文件重新应用注入，独立验证 Pass-to-Fail（P2F）效果：
 
 ```
-blast_radius_ok = target_tests_failed AND (unrelated_failure_rate ≤ threshold)
+Step 0: 创建隔离 worktree + venv，安装依赖
+Step 1: 健康检查 — 在干净 HEAD 上运行目标测试 → 期望 PASS
+Step 2: 应用 diff — git apply <saved_diff_path> → 注入缺陷
+Step 3: P2F 检查 — 在注入后运行目标测试 → 期望 FAIL
 
-其中:
-  unrelated_failure_rate = (total_failures - target_failure_count) / total_tests
-  threshold = PRI_BLAST_RADIUS_THRESHOLD（默认 10%）
+pass_to_fail = Step1_PASS AND Step3_FAIL
 ```
 
-#### 6.4.2 测试运行器自动检测
+**关键设计**：verify 不重跑 inject 的注入逻辑（L1/L2/L3），而是直接 `git apply` inject 阶段保存的 diff 文件。这带来三个好处：
+- **确定性**：所有级别的注入都通过同一路径（`git apply`）重放，结果完全确定
+- **L3 可验证**：LLM 注入的结果也能被验证（之前无法重放）
+- **代码简化**：verify 不再需要包含 AST Surgery、reverse_patch 等注入逻辑
+
+#### 6.4.2 Diff 文件管理
+
+inject 阶段将每个成功注入的 diff 保存为独立文件：
+
+```
+experiments/swebench_pro/diffs/
+├── instance_001.diff
+├── instance_002.diff
+└── ...
+```
+
+- JSONL 结果中 `injected_diff` 字段存储**从项目根目录开始的相对路径**
+- verify 阶段通过该路径读取 diff 文件并 `git apply`
+
+#### 6.4.3 测试运行器自动检测
 
 | 检测文件 | 使用的测试命令 |
 |----------|---------------|
@@ -581,7 +604,7 @@ blast_radius_ok = target_tests_failed AND (unrelated_failure_rate ≤ threshold)
 | `Gemfile` | `bundle exec rspec` |
 | `pom.xml` | `mvn test -q` |
 
-#### 6.4.3 测试输出解析
+#### 6.4.4 测试输出解析
 
 支持多种测试框架的输出格式解析：
 
@@ -920,6 +943,7 @@ await asyncio.to_thread(repo.remotes.origin.fetch)
 | `base_commit` | `str` | 注入时的 HEAD commit SHA（最新 main） | `base_commit` |
 | `problem_statement` | `str` | 提供给 AI Agent 的问题描述 | `problem_statement` |
 | `injection_level` | `str` | 实际使用的注入级别枚举值 | 扩展字段 |
+| `injected_diff` | `str` | 注入 diff 文件的相对路径（从项目根目录起） | 扩展字段 |
 | `golden_patch` | `str` | 标准修复方案 unified diff | `patch` |
 | `test_patch` | `str` | 验证所需的测试代码 diff | `test_patch` |
 | `hints_text` | `str` | 可选提示（默认为空） | `hints_text` |
@@ -963,6 +987,7 @@ PRI_LLM_API_KEY=sk-ant-xxxxxxxxxxxx    # API 密钥（或通过 ANTHROPIC_API_KE
 PRI_LLM_TEMPERATURE=0.2               # 生成温度（低温保证确定性）
 PRI_LLM_MAX_TOKENS=4096               # 最大输出 tokens
 PRI_LLM_MAX_RETRIES=3                 # API 调用最大重试次数
+# 注意: Level 3 LLM 注入默认启用，使用 --no-l3 命令行参数可禁用
 
 # 流水线
 PRI_WORKSPACE_DIR=.pri-workspace      # 工作区根目录（存放克隆仓库和 worktrees）
@@ -1148,8 +1173,8 @@ pr-injector/
 │   └── autopilot/
 │       └── spec.md                        # 项目规格说明
 │
-├── main.py                                # 直接运行入口（开发调试用）
-├── pyproject.toml                         # 项目配置（hatch 构建系统）
+├── main.py                                # 直接运行入口（uv run main.py）
+├── pyproject.toml                         # 项目配置（hatch 构建系统，uv 管理依赖）
 ├── .env.example                           # 环境变量示例
 ├── .gitignore
 └── README.md                              # 项目文档（中文）
@@ -1160,7 +1185,7 @@ pr-injector/
 ## 附录：关键数据流示意
 
 ```
-用户输入: python main.py run --repo pallets/flask --pr 5001
+用户输入: uv run main.py run --repo pallets/flask --pr 5001
                 │
                 ▼
         CLI (typer) 解析参数
