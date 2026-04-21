@@ -40,6 +40,7 @@ benchmark_dataset/
 *.log
 *.jsonl
 paper/
+experiments/
 
 # OS
 .DS_Store
