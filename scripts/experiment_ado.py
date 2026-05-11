@@ -57,6 +57,10 @@ REPO_CONFIGS = {
     },
 }
 
+# Baseline tolerance for healthy check (allow small noisy failures on HEAD)
+BASELINE_MAX_FAILED_ABS = 2
+BASELINE_MAX_FAILED_RATIO = 0.01
+
 
 # ---------------------------------------------------------------------------
 # Shared helpers (reused from experiment_csharp.py)
@@ -315,32 +319,63 @@ def run_dotnet_test(
                 failed = len(re.findall(r"^\s*Failed\s+", output, re.MULTILINE))
                 total = passed + failed
 
-        return {"returncode": proc.returncode, "passed": passed, "failed": failed,
-                "skipped": skipped, "total": total, "output_tail": output[-2000:]}
+        failed_tests = re.findall(r"^\s*Failed\s+([^\[]+?)\s+\[", output, re.MULTILINE)
+        failed_tests = sorted({t.strip() for t in failed_tests if t.strip()})
+
+        return {
+            "returncode": proc.returncode,
+            "passed": passed,
+            "failed": failed,
+            "skipped": skipped,
+            "total": total,
+            "failed_tests": failed_tests,
+            "output_tail": output[-2000:],
+        }
     except subprocess.TimeoutExpired:
-        return {"returncode": -1, "passed": 0, "failed": 0, "skipped": 0,
-                "total": 0, "output_tail": "TIMEOUT"}
+        return {
+            "returncode": -1,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total": 0,
+            "failed_tests": [],
+            "output_tail": "TIMEOUT",
+        }
     except Exception as e:
-        return {"returncode": -1, "passed": 0, "failed": 0, "skipped": 0,
-                "total": 0, "output_tail": str(e)}
+        return {
+            "returncode": -1,
+            "passed": 0,
+            "failed": 0,
+            "skipped": 0,
+            "total": 0,
+            "failed_tests": [],
+            "output_tail": str(e),
+        }
 
 
 def run_dotnet_test_multi(cwd: str, test_projects: list[str], timeout: int = 300) -> dict:
     total_passed, total_failed, total_skipped, total_total, worst_rc = 0, 0, 0, 0, 0
     all_output = []
+    failed_tests_all: set[str] = set()
     for proj in test_projects:
         result = run_dotnet_test(cwd, test_project=proj, timeout=timeout)
         total_passed += result["passed"]
         total_failed += result["failed"]
         total_skipped += result.get("skipped", 0)
         total_total += result["total"]
+        failed_tests_all.update(result.get("failed_tests", []))
         if result["returncode"] != 0:
             worst_rc = result["returncode"]
         all_output.append(f"--- {proj} ---\n{result['output_tail']}")
     return {
-        "returncode": worst_rc, "passed": total_passed, "failed": total_failed,
-        "skipped": total_skipped, "total": total_total,
-        "output_tail": "\n".join(all_output)[-2000:], "projects_tested": test_projects,
+        "returncode": worst_rc,
+        "passed": total_passed,
+        "failed": total_failed,
+        "skipped": total_skipped,
+        "total": total_total,
+        "failed_tests": sorted(failed_tests_all),
+        "output_tail": "\n".join(all_output)[-2000:],
+        "projects_tested": test_projects,
     }
 
 
@@ -458,17 +493,26 @@ def phase_sample(repo_cfg: dict, max_instances: int = 10) -> list[dict]:
     output_dir = repo_cfg["output_dir"]
     sampled_file = output_dir / "sampled.jsonl"
 
+    # Load already-sampled PR numbers to avoid duplicates
+    existing_pr_nums: set[int] = set()
+    if sampled_file.exists():
+        with open(sampled_file, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    existing_pr_nums.add(json.loads(line)["pr_number"])
+
     api_base = f"{ADO_ORG}/{ADO_PROJECT}/_apis/git/repositories/{ado_repo}"
 
     print(f"\n{'=' * 70}")
     print(f"  PHASE 1: SAMPLE PRs from {ADO_PROJECT}/{ado_repo}")
+    print(f"  Already sampled: {len(existing_pr_nums)} PRs")
     print(f"{'=' * 70}")
 
     # Fetch completed (merged) PRs — paginated
     all_prs: list[dict] = []
     skip = 0
     top = 100
-    while len(all_prs) < 500:
+    while len(all_prs) < 3000:
         print(f"  Fetching PRs (skip={skip})...")
         data = _ado_get(pat, f"{api_base}/pullrequests", params={
             "status": "completed",
@@ -497,6 +541,10 @@ def phase_sample(repo_cfg: dict, max_instances: int = 10) -> list[dict]:
         pr_id = pr["pullRequestId"]
         pr_title = pr.get("title", "")
 
+        # Skip already-sampled PRs
+        if pr_id in existing_pr_nums:
+            continue
+
         # Bug-fix filter
         pr_labels = [label.get("name", "") for label in pr.get("labels", [])]
         if not _is_likely_bugfix(pr_title, pr_labels):
@@ -514,9 +562,13 @@ def phase_sample(repo_cfg: dict, max_instances: int = 10) -> list[dict]:
         # ADO provides /diffs endpoint but git diff is more reliable
         repo_dir = str(repo_cfg["local_path"])
         # Fetch the merge commit if not available locally
-        git("fetch", "origin", merge_commit, cwd=repo_dir, timeout=120)
-        if source_commit:
-            git("fetch", "origin", source_commit, cwd=repo_dir, timeout=120)
+        try:
+            git("fetch", "origin", merge_commit, cwd=repo_dir, timeout=120)
+            if source_commit:
+                git("fetch", "origin", source_commit, cwd=repo_dir, timeout=120)
+        except subprocess.TimeoutExpired:
+            print(f"    [SKIP] PR #{pr_id}: git fetch timed out")
+            continue
 
         # Get the diff of the merge commit against its first parent
         diff = git_text("diff", f"{merge_commit}^", merge_commit, cwd=repo_dir, timeout=60)
@@ -558,7 +610,7 @@ def phase_sample(repo_cfg: dict, max_instances: int = 10) -> list[dict]:
     print(f"  Skipped (non bug-fix): {skipped_non_bugfix}")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    with open(sampled_file, "w", encoding="utf-8") as f:
+    with open(sampled_file, "a", encoding="utf-8") as f:
         for rec in qualifying:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
@@ -577,7 +629,7 @@ def phase_sample(repo_cfg: dict, max_instances: int = 10) -> list[dict]:
 # ============================================================================
 
 
-def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]:
+def phase_inject(repo_cfg: dict, max_instances: int | None = None, retry_failed: bool = False) -> list[dict]:
     """Inject bugs and verify P2F in a single worktree pass per PR."""
 
     output_dir = repo_cfg["output_dir"]
@@ -603,10 +655,34 @@ def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]
             if line.strip():
                 instances.append(json.loads(line))
 
-    if max_instances:
-        instances = instances[:max_instances]
-
     print(f"  Instances to process: {len(instances)}")
+
+    # Load already-processed PRs to skip duplicates (or filter to failed-only for retry)
+    done_pr_nums: set[int] = set()
+    failed_pr_nums: set[int] = set()
+    if injection_file.exists():
+        with open(injection_file, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rec = json.loads(line)
+                    done_pr_nums.add(rec["pr_number"])
+                    if not rec.get("success"):
+                        failed_pr_nums.add(rec["pr_number"])
+
+    if retry_failed:
+        # Only re-run previously failed PRs
+        instances = [i for i in instances if i["pr_number"] in failed_pr_nums]
+        if max_instances:
+            instances = instances[:max_instances]
+        print(f"  Retry mode: {len(failed_pr_nums)} failed PRs found, {len(instances)} in sample")
+    elif done_pr_nums:
+        instances = [i for i in instances if i["pr_number"] not in done_pr_nums]
+        if max_instances:
+            instances = instances[:max_instances]
+        print(f"  Already processed: {len(done_pr_nums)} PRs (skipping)")
+        print(f"  Remaining: {len(instances)}")
+    elif max_instances:
+        instances = instances[:max_instances]
 
     if not Path(repo_dir).exists():
         print(f"  [ERROR] Repo not found: {repo_dir}")
@@ -619,6 +695,18 @@ def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]
     print(f"  Latest HEAD: {head_sha[:12]} ({default_branch})")
 
     WORKTREES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Load existing results so incremental saves include prior runs
+    prior_results: list[dict] = []
+    retry_pr_nums = {i["pr_number"] for i in instances}
+    if injection_file.exists():
+        with open(injection_file, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    rec = json.loads(line)
+                    # Exclude PRs being retried so they get replaced
+                    if rec["pr_number"] not in retry_pr_nums:
+                        prior_results.append(rec)
     results: list[dict] = []
 
     stats = {
@@ -703,19 +791,33 @@ def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]
                     build_ok = False
             if not build_ok:
                 result["failure_reason"] = "build_failed_on_clean_head"
+                result["diagnostic"] = "build failed for test projects"
                 print(f"    [SKIP] Build failed on clean HEAD")
                 stats["healthy_skip"] += 1
                 results.append(result)
                 continue
 
-            healthy = run_dotnet_test_multi(str(wt_path), test_projects, timeout=600)
-            healthy_pass = healthy["returncode"] == 0 or (healthy["passed"] > 0 and healthy["failed"] == 0)
+            healthy = run_dotnet_test_multi(str(wt_path), test_projects, timeout=1500)
+            baseline_failed = healthy["failed"]
+            baseline_total = max(healthy["total"], baseline_failed)
+            baseline_ratio = (baseline_failed / baseline_total) if baseline_total > 0 else 1.0
+            baseline_tolerated = (
+                healthy["returncode"] in (0, 1)
+                and baseline_failed <= BASELINE_MAX_FAILED_ABS
+                and baseline_ratio <= BASELINE_MAX_FAILED_RATIO
+            )
+            healthy_pass = healthy["returncode"] == 0 or (healthy["passed"] > 0 and baseline_tolerated)
             print(f"          rc={healthy['returncode']} passed={healthy['passed']} "
                   f"failed={healthy['failed']} total={healthy['total']} "
+                  f"baseline_tolerated={baseline_tolerated} "
                   f"-> {'PASS' if healthy_pass else 'FAIL'}")
 
             if not healthy_pass:
                 result["failure_reason"] = "healthy_check_failed"
+                result["diagnostic"] = healthy.get("output_tail", "")[-1000:]
+                result["baseline_failed"] = baseline_failed
+                result["baseline_total"] = healthy["total"]
+                result["baseline_failed_tests"] = healthy.get("failed_tests", [])
                 print(f"    [SKIP] Tests already fail on clean HEAD")
                 stats["healthy_skip"] += 1
                 results.append(result)
@@ -798,10 +900,15 @@ def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]
                     _run_dotnet_build_project(str(wt_path), proj, timeout=900)
 
                 print(f"    [4/4] P2F check: running tests on buggy code...")
-                buggy = run_dotnet_test_multi(str(wt_path), test_projects, timeout=600)
-                target_failed = buggy["failed"] > 0 or (buggy["returncode"] != 0 and buggy["passed"] < healthy["passed"])
+                buggy = run_dotnet_test_multi(str(wt_path), test_projects, timeout=1500)
+                healthy_failed_tests = set(healthy.get("failed_tests", []))
+                buggy_failed_tests = set(buggy.get("failed_tests", []))
+                new_failed_tests = sorted(buggy_failed_tests - healthy_failed_tests)
+                fail_count_increase = buggy["failed"] - healthy["failed"]
+                target_failed = len(new_failed_tests) > 0 or fail_count_increase > 0
                 print(f"          rc={buggy['returncode']} passed={buggy['passed']} "
                       f"failed={buggy['failed']} total={buggy['total']} "
+                      f"delta_failed={fail_count_increase} new_failed_tests={len(new_failed_tests)} "
                       f"-> {'FAIL (good!)' if target_failed else 'PASS (bad!)'}")
 
                 duration = time.monotonic() - start_time
@@ -812,10 +919,14 @@ def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]
                     "healthy_passed": healthy["passed"],
                     "healthy_failed": healthy["failed"],
                     "healthy_total": healthy["total"],
+                    "healthy_failed_tests": sorted(healthy_failed_tests),
                     "buggy_rc": buggy["returncode"],
                     "buggy_passed": buggy["passed"],
                     "buggy_failed": buggy["failed"],
                     "buggy_total": buggy["total"],
+                    "buggy_failed_tests": sorted(buggy_failed_tests),
+                    "new_failed_tests": new_failed_tests,
+                    "fail_count_increase": fail_count_increase,
                     "target_tests_failed": target_failed,
                     "pass_to_fail": target_failed,
                     "duration_seconds": round(duration, 2),
@@ -842,14 +953,15 @@ def phase_inject(repo_cfg: dict, max_instances: int | None = None) -> list[dict]
 
         # Incremental save
         output_dir.mkdir(parents=True, exist_ok=True)
+        all_results = prior_results + results
         with open(injection_file, "w", encoding="utf-8") as f:
-            for r in results:
+            for r in all_results:
                 r_out = dict(r)
                 if r_out.get("injected_diff") and len(r_out["injected_diff"]) > 50000:
                     r_out["injected_diff"] = r_out["injected_diff"][:50000] + "\n... (truncated)"
                 f.write(json.dumps(r_out, ensure_ascii=False, default=str) + "\n")
         with open(verification_file, "w", encoding="utf-8") as f:
-            for r in results:
+            for r in all_results:
                 r_out = {k: v for k, v in r.items() if k != "injected_diff"}
                 f.write(json.dumps(r_out, ensure_ascii=False, default=str) + "\n")
 
@@ -902,6 +1014,11 @@ def main():
         default=10,
         help="Maximum number of instances (default: 10)",
     )
+    parser.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help="Re-run only previously failed PRs (healthy_check_failed, build_failed, etc.)",
+    )
     args = parser.parse_args()
 
     _load_env()
@@ -912,7 +1029,7 @@ def main():
         phase_sample(repo_cfg, max_instances=args.max)
 
     if args.phase in ("inject", "all"):
-        phase_inject(repo_cfg, max_instances=args.max)
+        phase_inject(repo_cfg, max_instances=args.max, retry_failed=args.retry_failed)
 
     print(f"\nDone.")
 
