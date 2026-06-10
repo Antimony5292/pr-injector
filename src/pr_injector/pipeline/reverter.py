@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import os
+
 from pr_injector.ast_engine.engine import ASTEngine
+from pr_injector.ast_engine.hunk_surgeon import (
+    old_changed_line_ranges_for_file,
+    overlaps_any_range,
+    reverse_patch_hunks_for_file,
+)
 from pr_injector.ast_engine.node_matcher import find_functions
 from pr_injector.ast_engine.surgeon import ASTSurgeon
+from pr_injector.core.compatibility import (
+    CompatibilityReport,
+    check_source_compatibility,
+    reports_to_dicts,
+)
 from pr_injector.core.diff_parser import parse_diff, reverse_diff
 from pr_injector.core.exceptions import ASTMatchFailed, ASTSurgeryFailed, RevertFailed
 from pr_injector.core.git_ops import GitWorkspace
@@ -164,6 +176,25 @@ class PRReverter:
 
         all_diffs: list[str] = []
         conflict_files: list[str] = []
+        compatibility_flagged_files: list[str] = []
+        compatibility_rejected_files: list[str] = []
+        compatibility_reports: list[CompatibilityReport] = []
+        hunk_replacements: list[dict] = []
+        skipped_whole_function_replacements: list[str] = []
+        level2_mode = os.environ.get("PRI_LEVEL2_MODE", "original_ast").lower()
+        use_hunk_first = level2_mode in {"hunk_first", "conservative_hunk_first"}
+        allow_whole_function = os.environ.get("PRI_ALLOW_WHOLE_FUNCTION_LEVEL2", "1").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        reject_on_compatibility = os.environ.get("PRI_REJECT_COMPATIBILITY", "").lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
 
         for source_file in analysis.source_files:
             # Read the current version of the file
@@ -177,11 +208,40 @@ class PRReverter:
             try:
                 # Try to identify functions changed in the original fix
                 # and replace them with pre-fix versions
-                modified_content = await self._ast_revert_file(
-                    source_file, current_content, original_diff, repo_path, candidate
-                )
+                modified_content = None
+                if use_hunk_first:
+                    hunk_result = reverse_patch_hunks_for_file(
+                        source_file, current_content, original_diff
+                    )
+                    if hunk_result.changed:
+                        modified_content = hunk_result.content
+                        hunk_replacements.extend(hunk_result.to_metadata())
+
+                if modified_content is None:
+                    if not allow_whole_function:
+                        skipped_whole_function_replacements.append(source_file)
+                        continue
+                    modified_content = await self._ast_revert_file(
+                        source_file, current_content, original_diff, repo_path, candidate
+                    )
 
                 if modified_content and modified_content != current_content:
+                    compatibility = check_source_compatibility(
+                        source_file, current_content, modified_content
+                    )
+                    compatibility_reports.append(compatibility)
+                    if compatibility.checked and not compatibility.passed:
+                        compatibility_flagged_files.append(source_file)
+                        logger.info(
+                            "level_2_compatibility_flagged",
+                            file=source_file,
+                            issues=[issue.code for issue in compatibility.issues],
+                        )
+                        if reject_on_compatibility:
+                            conflict_files.append(source_file)
+                            compatibility_rejected_files.append(source_file)
+                            continue
+
                     diff = self.surgeon.apply_surgery(
                         worktree_path, source_file, modified_content
                     )
@@ -195,6 +255,14 @@ class PRReverter:
                     error=str(e),
                 )
                 conflict_files.append(source_file)
+
+        if compatibility_rejected_files:
+            logger.info(
+                "level_2_rejected_by_compatibility",
+                pr=candidate.metadata.pr_number,
+                files=compatibility_rejected_files,
+            )
+            return None
 
         if not all_diffs:
             logger.info("level_2_no_successful_reverts", pr=candidate.metadata.pr_number)
@@ -217,6 +285,17 @@ class PRReverter:
             golden_patch=golden_patch,
             worktree_path=worktree_path,
             conflict_files=conflict_files,
+            compatibility_reports=reports_to_dicts(compatibility_reports),
+            quality_metadata={
+                "hunk_replacements": hunk_replacements,
+                "compatibility_flagged_files": compatibility_flagged_files,
+                "compatibility_rejected_files": compatibility_rejected_files,
+                "skipped_whole_function_replacements": skipped_whole_function_replacements,
+                "whole_function_level2_enabled": allow_whole_function,
+                "level2_mode": level2_mode,
+                "hunk_first_enabled": use_hunk_first,
+                "reject_on_compatibility": reject_on_compatibility,
+            },
         )
 
     async def _ast_revert_file(
@@ -272,15 +351,30 @@ class PRReverter:
             return None
 
         pre_fix_functions = find_functions(pre_fix_tree, language)
-        pre_fix_map = {f.name: f for f in pre_fix_functions}
+        changed_ranges = old_changed_line_ranges_for_file(file_path, original_diff)
+        if changed_ranges:
+            pre_fix_functions = [
+                func for func in pre_fix_functions
+                if overlaps_any_range(func.start_line, func.end_line, changed_ranges)
+            ]
+        pre_fix_map = {f.qualified_name: f for f in pre_fix_functions}
+        bare_name_counts: dict[str, int] = {}
+        for func in pre_fix_functions:
+            bare_name_counts[func.name] = bare_name_counts.get(func.name, 0) + 1
+        for func in pre_fix_functions:
+            if bare_name_counts[func.name] == 1:
+                pre_fix_map.setdefault(func.name, func)
 
         # Find functions that exist in both versions (potential revert targets)
         modified_content = current_content
         replaced_any = False
 
         for current_func in current_functions:
-            if current_func.name in pre_fix_map:
-                pre_fix_func = pre_fix_map[current_func.name]
+            lookup_name = current_func.qualified_name
+            if lookup_name not in pre_fix_map and bare_name_counts.get(current_func.name) == 1:
+                lookup_name = current_func.name
+            if lookup_name in pre_fix_map:
+                pre_fix_func = pre_fix_map[lookup_name]
 
                 # Get the function text from both versions
                 current_text = current_func.get_text(current_content.encode("utf-8"))
@@ -292,7 +386,7 @@ class PRReverter:
                         modified_content = self.surgeon.compute_replacement(
                             modified_content,
                             pre_fix_text,
-                            current_func.name,
+                            current_func.qualified_name,
                             file_path,
                         )
                         replaced_any = True

@@ -63,6 +63,8 @@ class RevertResult(BaseModel):
     golden_patch: str
     worktree_path: str
     conflict_files: list[str] = Field(default_factory=list)
+    compatibility_reports: list[dict] = Field(default_factory=list)
+    quality_metadata: dict = Field(default_factory=dict)
 
 
 class LLMInjectionResult(BaseModel):
@@ -90,6 +92,9 @@ class VerificationResult(BaseModel):
     total_tests_run: int = 0
     total_failures: int = 0
     test_duration_seconds: float = 0.0
+    golden_repair_passed: bool | None = None
+    pass_to_pass_checked: bool = False
+    pass_to_pass_passed: bool | None = None
 
 
 class BenchmarkInstance(BaseModel):
@@ -105,3 +110,4 @@ class BenchmarkInstance(BaseModel):
     hints_text: str = ""
     created_at: datetime = Field(default_factory=lambda: datetime.now(tz=timezone.utc))
     verification: VerificationResult | None = None
+    quality_metadata: dict = Field(default_factory=dict)

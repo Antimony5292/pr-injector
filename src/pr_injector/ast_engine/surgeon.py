@@ -113,10 +113,9 @@ class ASTSurgeon:
                 )
             # Check for syntax errors
             if tree.root_node.has_error:
-                logger.warning(
-                    "surgery_syntax_errors",
-                    file=file_path,
-                    target=target_name,
+                raise ASTSurgeryFailed(
+                    f"Modified source for {file_path} contains syntax errors after "
+                    f"replacing {target_name}"
                 )
 
         return modified_source

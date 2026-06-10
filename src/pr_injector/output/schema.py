@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pr_injector.core.models import InjectionLevel, VerificationResult
 
@@ -25,6 +25,7 @@ class BenchmarkOutput(BaseModel):
     test_patch: str
     hints_text: str = ""
     created_at: str = ""
+    quality_metadata: dict = Field(default_factory=dict)
 
     @classmethod
     def from_benchmark_instance(
@@ -39,6 +40,7 @@ class BenchmarkOutput(BaseModel):
         hints_text: str = "",
         created_at: datetime | None = None,
         verification: VerificationResult | None = None,
+        quality_metadata: dict | None = None,
     ) -> BenchmarkOutput:
         """Create output from a BenchmarkInstance's fields."""
         return cls(
@@ -51,4 +53,5 @@ class BenchmarkOutput(BaseModel):
             test_patch=test_patch,
             hints_text=hints_text,
             created_at=(created_at or datetime.now()).isoformat(),
+            quality_metadata=quality_metadata or {},
         )

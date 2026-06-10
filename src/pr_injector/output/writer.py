@@ -39,6 +39,7 @@ class JSONLWriter:
             hints_text=instance.hints_text,
             created_at=instance.created_at,
             verification=instance.verification,
+            quality_metadata=instance.quality_metadata,
         )
         line = orjson.dumps(output.model_dump(), option=orjson.OPT_APPEND_NEWLINE)
 

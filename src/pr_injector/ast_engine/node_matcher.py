@@ -25,9 +25,11 @@ class NodeMatch:
         end_line: int,
         start_byte: int,
         end_byte: int,
+        qualified_name: str | None = None,
     ) -> None:
         self.node = node
         self.name = name
+        self.qualified_name = qualified_name or name
         self.node_type = node_type
         self.start_line = start_line
         self.end_line = end_line
@@ -39,7 +41,10 @@ class NodeMatch:
         return source[self.start_byte : self.end_byte].decode("utf-8", errors="replace")
 
     def __repr__(self) -> str:
-        return f"NodeMatch({self.node_type} '{self.name}' L{self.start_line}-{self.end_line})"
+        return (
+            f"NodeMatch({self.node_type} '{self.qualified_name}' "
+            f"L{self.start_line}-{self.end_line})"
+        )
 
 
 def _get_node_name(node: tree_sitter.Node, language: str) -> str | None:
@@ -57,6 +62,23 @@ def _get_node_name(node: tree_sitter.Node, language: str) -> str | None:
             return child.text.decode("utf-8", errors="replace") if child.text else None
 
     return None
+
+
+def _get_qualified_name(node: tree_sitter.Node, language: str) -> str | None:
+    name = _get_node_name(node, language)
+    if not name:
+        return None
+
+    parts = [name]
+    parent = node.parent
+    while parent is not None:
+        if parent.type in CLASS_NODE_TYPES.get(language, []):
+            parent_name = _get_node_name(parent, language)
+            if parent_name:
+                parts.append(parent_name)
+        parent = parent.parent
+
+    return ".".join(reversed(parts))
 
 
 def find_functions(
@@ -116,7 +138,7 @@ def find_node_by_name(
         nodes = find_classes(tree, language)
 
     for match in nodes:
-        if match.name == name:
+        if match.name == name or match.qualified_name == name:
             return match
 
     return None
@@ -132,10 +154,12 @@ def _walk_tree(
     if node.type in target_types:
         name = _get_node_name(node, language)
         if name:
+            qualified_name = _get_qualified_name(node, language)
             matches.append(
                 NodeMatch(
                     node=node,
                     name=name,
+                    qualified_name=qualified_name,
                     node_type=node.type,
                     start_line=node.start_point[0] + 1,  # 1-indexed
                     end_line=node.end_point[0] + 1,

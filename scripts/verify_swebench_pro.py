@@ -15,6 +15,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import shutil
 import subprocess
 import sys
 import time
+import tomllib
 from pathlib import Path
 
 if sys.platform == "win32":
@@ -46,33 +48,193 @@ class _Tee:
 
 
 PYTHON = sys.executable
+BUNDLED_PYTHON_312 = Path(
+    os.environ.get("CODEX_BUNDLED_PYTHON", sys.executable)
+).expanduser()
 
 
-def _find_python() -> str:
-    """Find the best available Python interpreter (prefer 3.12+ for ansible)."""
-    for candidate in ("python3.12", "python3.13", "python3.14", "python3"):
+def _stable_id_suffix(*parts: str, length: int = 12) -> str:
+    data = "::".join(parts).encode("utf-8", errors="replace")
+    return hashlib.sha1(data).hexdigest()[:length]
+
+
+def _read_requires_python(worktree: str | Path | None) -> str | None:
+    if not worktree:
+        return None
+    pyproject = Path(worktree) / "pyproject.toml"
+    if not pyproject.exists():
+        return None
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    project = data.get("project", {})
+    value = project.get("requires-python")
+    return value if isinstance(value, str) and value.strip() else None
+
+
+def _python_version_tuple(python_bin: str) -> tuple[int, int, int] | None:
+    proc = subprocess.run(
+        [
+            python_bin,
+            "-c",
+            "import sys; print('.'.join(map(str, sys.version_info[:3])))",
+        ],
+        capture_output=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        return None
+    try:
+        parts = proc.stdout.decode().strip().split(".")
+        return tuple(int(p) for p in parts[:3])  # type: ignore[return-value]
+    except Exception:
+        return None
+
+
+def _version_satisfies(version: tuple[int, int, int], spec: str | None) -> bool:
+    if not spec:
+        return True
+    for raw_part in spec.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        match = re.match(r"(<=|>=|==|<|>|~=)\s*(\d+(?:\.\d+){0,2})", part)
+        if not match:
+            continue
+        op, rhs_text = match.groups()
+        rhs_parts = [int(p) for p in rhs_text.split(".")]
+        rhs = tuple((rhs_parts + [0, 0, 0])[:3])
+        if op == ">=" and not (version >= rhs):
+            return False
+        if op == ">" and not (version > rhs):
+            return False
+        if op == "<=" and not (version <= rhs):
+            return False
+        if op == "<" and not (version < rhs):
+            return False
+        if op == "==" and not (version == rhs):
+            return False
+        if op == "~=":
+            upper = (rhs[0] + 1, 0, 0) if len(rhs_parts) == 1 else (rhs[0], rhs[1] + 1, 0)
+            if not (version >= rhs and version < upper):
+                return False
+    return True
+
+
+def _find_python(repo: str = "", worktree: str | Path | None = None) -> str | None:
+    """Find the best available Python interpreter for creating test venvs."""
+    requires_python = _read_requires_python(worktree)
+    if requires_python:
+        candidates = [
+            sys.executable,
+            "python3.13",
+            "python3.12",
+            str(BUNDLED_PYTHON_312),
+            "python3.14",
+            "python3",
+        ]
+    else:
+        candidates = [
+            sys.executable,
+            "python3.13",
+            "python3.12",
+            str(BUNDLED_PYTHON_312),
+            "python3",
+            "python3.14",
+        ]
+    seen: set[str] = set()
+    for candidate in candidates:
         p = shutil.which(candidate)
-        if p:
+        if not p and Path(candidate).exists():
+            p = str(Path(candidate))
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        version = _python_version_tuple(p)
+        if (
+            version
+            and _version_satisfies(version, requires_python)
+            and _python_has_venv_and_pip(p)
+        ):
             return p
+    if requires_python:
+        print(
+            "        [ERROR] No available Python satisfies "
+            f"{requires_python} for {repo or worktree}"
+        )
+        return None
     return sys.executable
 
 
-def _create_venv(worktree: str) -> str:
+def _python_has_venv_and_pip(python_bin: str) -> bool:
+    probe = subprocess.run(
+        [python_bin, "-c", "import ensurepip, venv"],
+        capture_output=True,
+        timeout=10,
+    )
+    return probe.returncode == 0
+
+
+def _prepare_python_runtime_env(python_bin: str) -> None:
+    version = _python_version_tuple(python_bin)
+    if not version or version < (3, 14, 0):
+        return
+    expat_lib = Path("/opt/homebrew/opt/expat/lib")
+    if not expat_lib.exists():
+        return
+    for key in ("DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH"):
+        current = os.environ.get(key, "")
+        paths = [p for p in current.split(os.pathsep) if p]
+        if str(expat_lib) not in paths:
+            os.environ[key] = os.pathsep.join([str(expat_lib)] + paths)
+
+
+def _create_venv(worktree: str, repo: str = "") -> str:
     """Create an isolated venv inside the worktree. Returns path to the venv python."""
+    python_bin = _find_python(repo, worktree)
+    if not python_bin:
+        return ""
+    _prepare_python_runtime_env(python_bin)
     venv_dir = os.path.join(worktree, ".venv")
-    python_bin = _find_python()
+    if os.environ.get("PRI_SHARED_REPO_VENV") == "1":
+        version = _python_version_tuple(python_bin) or (0, 0, 0)
+        repo_id = repo.replace("/", "__") if repo else "unknown_repo"
+        tag = re.sub(r"[^A-Za-z0-9_.-]+", "_", os.environ.get("PRI_SHARED_REPO_VENV_TAG", "default"))
+        project_root = Path(__file__).resolve().parent.parent
+        venv_dir = str(
+            project_root
+            / ".pri-workspace"
+            / "shared_venvs"
+            / f"{tag}-{repo_id}-py{version[0]}.{version[1]}.{version[2]}"
+        )
+    venv_preexists = os.path.exists(venv_dir)
+    version = _python_version_tuple(python_bin) or (0, 0, 0)
+    venv_cmd = [python_bin, "-m", "venv"]
+    if version >= (3, 14, 0):
+        # Homebrew Python 3.14.5 can expose a working global pip while
+        # ensurepip inside venv fails due to pyexpat/libexpat linkage. Use
+        # system site packages for Python-version-constrained projects such as
+        # openlibrary, and let pip install project deps into the venv overlay.
+        venv_cmd += ["--without-pip", "--system-site-packages"]
+    venv_cmd.append(venv_dir)
     subprocess.run(
-        [python_bin, "-m", "venv", venv_dir],
+        venv_cmd,
         cwd=worktree, capture_output=True, timeout=60,
     )
     venv_python = os.path.join(venv_dir, "bin", "python")
     if not os.path.exists(venv_python):
         venv_python = os.path.join(venv_dir, "Scripts", "python.exe")  # Windows
-    # Upgrade pip to avoid old-pip issues
-    subprocess.run(
-        [venv_python, "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"],
-        cwd=worktree, capture_output=True, timeout=120,
-    )
+    if not venv_preexists and version < (3, 14, 0):
+        subprocess.run(
+            [venv_python, "-m", "ensurepip", "--upgrade"],
+            cwd=worktree, capture_output=True, timeout=120,
+        )
+        # Upgrade pip to avoid old-pip issues.
+        subprocess.run(
+            [venv_python, "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"],
+            cwd=worktree, capture_output=True, timeout=120,
+        )
     return venv_python
 
 
@@ -86,6 +248,48 @@ def git(*args: str, cwd: str, timeout: int = 600) -> subprocess.CompletedProcess
 def git_text(*args: str, cwd: str, timeout: int = 600) -> str:
     r = git(*args, cwd=cwd, timeout=timeout)
     return r.stdout.decode(errors="replace")
+
+
+def ensure_repo_head(repo_dir: Path, default_branch: str) -> None:
+    """Repair local clone HEAD when it points at a stale or invalid branch."""
+    head = git("rev-parse", "--verify", "HEAD", cwd=str(repo_dir), timeout=60)
+    if head.returncode == 0:
+        return
+    remote_ref = f"origin/{default_branch}"
+    resolved = git_text("rev-parse", remote_ref, cwd=str(repo_dir), timeout=60).strip()
+    if not resolved:
+        return
+    local_ref = f"refs/heads/{default_branch}"
+    git("update-ref", local_ref, resolved, cwd=str(repo_dir), timeout=60)
+    git("symbolic-ref", "HEAD", local_ref, cwd=str(repo_dir), timeout=60)
+
+
+def cleanup_worktree_branch(repo_dir: Path, branch: str, wt_path: Path | None = None) -> None:
+    """Remove stale worktree/branch state left by interrupted verification runs."""
+    git("worktree", "prune", cwd=str(repo_dir), timeout=120)
+    if wt_path and wt_path.exists():
+        git("worktree", "remove", "--force", str(wt_path), cwd=str(repo_dir), timeout=120)
+        shutil.rmtree(wt_path, ignore_errors=True)
+
+    delete = git("branch", "-D", branch, cwd=str(repo_dir), timeout=120)
+    if delete.returncode == 0:
+        return
+
+    listing = git_text("worktree", "list", "--porcelain", cwd=str(repo_dir), timeout=120)
+    current_path: str | None = None
+    branch_ref = f"refs/heads/{branch}"
+    for line in listing.splitlines() + [""]:
+        if line.startswith("worktree "):
+            current_path = line.removeprefix("worktree ").strip()
+        elif line == f"branch {branch_ref}" and current_path:
+            git("worktree", "remove", "--force", current_path, cwd=str(repo_dir), timeout=120)
+            shutil.rmtree(current_path, ignore_errors=True)
+            current_path = None
+        elif not line:
+            current_path = None
+
+    git("worktree", "prune", cwd=str(repo_dir), timeout=120)
+    git("branch", "-D", branch, cwd=str(repo_dir), timeout=120)
 
 
 def run_pytest(cwd: str, test_files: list[str], timeout: int = 300, python: str | None = None) -> dict:
@@ -107,6 +311,7 @@ def run_pytest(cwd: str, test_files: list[str], timeout: int = 300, python: str 
         "QTWEBENGINE_CHROMIUM_FLAGS": "--disable-gpu --no-sandbox",
         "QT_QUICK_BACKEND": "software",
     })
+    env["PYTHONPATH"] = cwd + os.pathsep + env.get("PYTHONPATH", "")
     try:
         proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout, env=env)
         stdout = proc.stdout.decode(errors="replace")
@@ -142,12 +347,160 @@ def run_pytest(cwd: str, test_files: list[str], timeout: int = 300, python: str 
                 "failed_tests": [], "output_tail": str(e)}
 
 
+def run_django_tests(cwd: str, labels: list[str], timeout: int = 300, python: str | None = None) -> dict:
+    """Run Django's in-repo test runner on dotted test labels."""
+    py = python or PYTHON
+    cmd = [
+        py, "tests/runtests.py",
+        "--verbosity=1",
+        "--failfast",
+        "--parallel=1",
+        "--noinput",
+    ] + labels
+    env = os.environ.copy()
+    env.update({
+        "PYTHONWARNINGS": "default",
+        "DJANGO_SETTINGS_MODULE": "test_sqlite",
+    })
+    env["PYTHONPATH"] = cwd + os.pathsep + env.get("PYTHONPATH", "")
+    try:
+        proc = subprocess.run(cmd, cwd=cwd, capture_output=True, timeout=timeout, env=env)
+        stdout = proc.stdout.decode(errors="replace")
+        stderr = proc.stderr.decode(errors="replace")
+        output = stdout + "\n" + stderr
+
+        passed, failed = 0, 0
+        ran = re.search(r"Ran (\d+) tests?", output)
+        if ran:
+            passed = int(ran.group(1)) if proc.returncode == 0 else 0
+            failed = 0 if proc.returncode == 0 else int(ran.group(1))
+        elif proc.returncode == 0:
+            passed = len(labels)
+        else:
+            failed = max(1, len(labels))
+
+        failed_tests: list[str] = []
+        for label in labels:
+            method = label.rsplit(".", 1)[-1]
+            if proc.returncode != 0 and method:
+                failed_tests.append(label)
+
+        return {
+            "returncode": proc.returncode,
+            "passed": passed,
+            "failed": failed,
+            "total": passed + failed,
+            "failed_tests": failed_tests,
+            "output_tail": output[-2000:],
+        }
+    except subprocess.TimeoutExpired:
+        return {"returncode": -1, "passed": 0, "failed": 0, "total": 0,
+                "failed_tests": [], "output_tail": "TIMEOUT"}
+    except Exception as e:
+        return {"returncode": -1, "passed": 0, "failed": 0, "total": 0,
+                "failed_tests": [], "output_tail": str(e)}
+
+
+def run_repo_tests(
+    cwd: str,
+    repo: str,
+    tests: list[str],
+    timeout: int = 300,
+    python: str | None = None,
+) -> dict:
+    if repo == "django/django":
+        return run_django_tests(cwd, tests, timeout=timeout, python=python)
+    return run_pytest(cwd, tests, timeout=timeout, python=python)
+
+
+def _test_runner_available(worktree: str, repo: str, python: str) -> bool:
+    if not python:
+        return False
+    if repo == "django/django":
+        return (Path(worktree) / "tests" / "runtests.py").exists()
+    probe = subprocess.run(
+        [python, "-m", "pytest", "--version"],
+        cwd=worktree,
+        capture_output=True,
+        timeout=30,
+    )
+    return probe.returncode == 0
+
+
+def _collectable_tests(
+    worktree: str,
+    repo: str,
+    tests: list[str],
+    python: str,
+    timeout: int = 60,
+) -> list[str]:
+    if repo == "django/django":
+        return tests
+    collectable: list[str] = []
+    for test in tests:
+        proc = subprocess.run(
+            [python, "-m", "pytest", "--collect-only", "-q", test],
+            cwd=worktree,
+            capture_output=True,
+            timeout=timeout,
+        )
+        if proc.returncode == 0:
+            collectable.append(test)
+            continue
+
+        remapped = _remap_pytest_nodeid(Path(worktree), test, python, timeout=timeout)
+        for nodeid in remapped:
+            if nodeid in collectable:
+                continue
+            check = subprocess.run(
+                [python, "-m", "pytest", "--collect-only", "-q", nodeid],
+                cwd=worktree,
+                capture_output=True,
+                timeout=timeout,
+            )
+            if check.returncode == 0:
+                collectable.append(nodeid)
+    return collectable
+
+
+def _filter_passing_tests(
+    cwd: str,
+    repo: str,
+    tests: list[str],
+    python: str,
+    timeout: int,
+) -> tuple[list[str], list[str]]:
+    """Return tests that pass when run individually and tests that do not."""
+    passing: list[str] = []
+    failing: list[str] = []
+    for test in tests:
+        result = run_repo_tests(cwd, repo, [test], timeout=timeout, python=python)
+        if result["returncode"] == 0 and int(result.get("total") or 0) > 0:
+            passing.append(test)
+        else:
+            failing.append(test)
+    return passing, failing
+
+
 def _install_project(worktree: str, repo: str, timeout: int = 300, python: str | None = None,
                      test_files: list[str] | None = None) -> bool:
     """Install project and test dependencies in the worktree using isolated venv."""
     wt = Path(worktree)
-    py = python or PYTHON
+    py = PYTHON if python is None else python
+    if not py:
+        print("        [ERROR] No Python interpreter available for dependency install")
+        return False
+    _prepare_python_runtime_env(py)
+    if repo == "internetarchive/openlibrary":
+        os.environ.setdefault("PIP_IGNORE_REQUIRES_PYTHON", "1")
     pip_base = [py, "-m", "pip", "install", "-q"]
+    pip_check = subprocess.run(
+        [py, "-m", "pip", "--version"], cwd=worktree, capture_output=True, timeout=30
+    )
+    if pip_check.returncode != 0:
+        stderr = pip_check.stderr.decode(errors="replace") if pip_check.stderr else ""
+        print(f"        [ERROR] pip is unavailable in venv: {stderr[-300:]}")
+        return False
 
     # Initialize git submodules if any
     subprocess.run(
@@ -162,6 +515,16 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
             if sub.is_dir() and (
                 (sub / "setup.py").exists() or (sub / "pyproject.toml").exists()
             ):
+                for vendor_req in ("requirements.txt", "requirements_test.txt"):
+                    if (sub / vendor_req).exists():
+                        r = subprocess.run(
+                            pip_base + ["-r", str(sub / vendor_req)],
+                            cwd=worktree, capture_output=True, timeout=timeout
+                        )
+                        if r.returncode != 0:
+                            _install_requirements_best_effort(
+                                pip_base, sub / vendor_req, worktree, timeout
+                            )
                 subprocess.run(pip_base + ["-e", str(sub)], cwd=worktree,
                                capture_output=True, timeout=timeout)
         # Also add vendor dir to Python path via .pth file for non-installable packages
@@ -176,7 +539,30 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
                 pth_file.write_text(str(vendor_dir) + "\n")
 
     # Always ensure pytest is available first
-    subprocess.run(pip_base + ["pytest"], cwd=worktree, capture_output=True, timeout=120)
+    pytest_install = subprocess.run(
+        pip_base + ["pytest"], cwd=worktree, capture_output=True, timeout=120
+    )
+    if pytest_install.returncode != 0:
+        stderr = pytest_install.stderr.decode(errors="replace") if pytest_install.stderr else ""
+        print(f"        [WARN] Could not install pytest: {stderr[-300:]}")
+
+    repo_bootstrap = {
+        "scikit-learn/scikit-learn": [
+            "ninja", "meson-python", "Cython", "numpy", "scipy", "joblib", "threadpoolctl"
+        ],
+        "matplotlib/matplotlib": [
+            "ninja", "meson-python", "pybind11", "numpy"
+        ],
+        "qutebrowser/qutebrowser": [
+            "Pillow",
+        ],
+    }
+    bootstrap_packages = repo_bootstrap.get(repo, [])
+    if bootstrap_packages:
+        subprocess.run(
+            pip_base + bootstrap_packages,
+            cwd=worktree, capture_output=True, timeout=timeout,
+        )
 
     # Install requirement files (including repo-specific patterns)
     req_patterns = [
@@ -192,8 +578,13 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
                 # Fallback: install line-by-line, skipping failures
                 _install_requirements_best_effort(pip_base, wt / req_file, worktree, timeout)
 
-    # Install the project itself
-    if (wt / "pyproject.toml").exists() or (wt / "setup.py").exists():
+    # Install the project itself. Open Library's root pyproject has a narrow
+    # Python pin and setup.py cythonizes optional Solr code; targeted tests can
+    # import package sources from the worktree root after dependencies/vendor
+    # packages are installed.
+    if repo == "internetarchive/openlibrary":
+        installed = True
+    elif (wt / "pyproject.toml").exists() or (wt / "setup.py").exists():
         installed = False
         for extras in [".[test]", ".[dev]", ".[testing]", "."]:
             r = subprocess.run(pip_base + ["-e", extras], cwd=worktree,
@@ -210,6 +601,11 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
         if not installed:
             print(f"        [WARN] Could not install project via pip install -e")
 
+    # Django uses tests/runtests.py labels, not pytest nodeids. The project
+    # install above is enough for these smoke-level targeted runs.
+    if repo == "django/django":
+        return True
+
     # Try to fix missing modules iteratively (up to 5 rounds)
     # Use target test files for collection so conftest imports are detected
     co_args = [py, "-m", "pytest", "--co", "-q"] + (test_files or [])
@@ -222,8 +618,19 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
         stdout = r.stdout.decode(errors="replace") if r.stdout else ""
         combined = stderr + stdout
 
-        # Find missing pytest plugins
-        missing_plugins = re.findall(r"pytest-\w+(?:-\w+)*", combined)
+        # Find explicitly missing pytest plugins. Avoid scanning arbitrary
+        # paths, which can contain strings like "pytest-net-worktrees".
+        missing_plugins = re.findall(
+            r"(?:No module named|ModuleNotFoundError: No module named|ImportError: No module named) "
+            r"'?(pytest[-_]\w+(?:[-_]\w+)*)'?",
+            combined,
+        )
+        for plugin_line in re.findall(r"Missing required plugins: ([^\n]+)", combined):
+            missing_plugins.extend(
+                p.strip()
+                for p in plugin_line.split(",")
+                if p.strip().startswith("pytest-")
+            )
 
         # Detect unknown config options that indicate missing plugins
         unknown_opts = re.findall(r"Unknown config option: (\w+)", combined)
@@ -231,10 +638,16 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
             "xvfb_colordepth": "pytest-xvfb",
             "xvfb_width": "pytest-xvfb",
             "xvfb_height": "pytest-xvfb",
+            "mypy_pyproject_toml_file": "pytest-mypy-plugins",
         }
         for opt in unknown_opts:
             if opt in CONFIG_TO_PLUGIN:
                 missing_plugins.append(CONFIG_TO_PLUGIN[opt])
+
+        unrecognized_args = re.findall(r"unrecognized arguments?: ([^\n]+)", combined)
+        for arg_line in unrecognized_args:
+            if "--mypy-pyproject-toml-file" in arg_line:
+                missing_plugins.append("pytest-mypy-plugins")
 
         # Find missing modules from ImportError/ModuleNotFoundError
         missing_modules = re.findall(r"No module named '([\w.]+)'", combined)
@@ -257,7 +670,7 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
             "dateutil": "python-dateutil",
             "dotenv": "python-dotenv",
             "gi": "PyGObject",
-            "web": "webpy",
+            "web": "web.py",
             "memcache": "python-memcached",
             "psycopg2": "psycopg2-binary",
         }
@@ -299,14 +712,333 @@ def _install_requirements_best_effort(pip_base: list[str], req_path: Path, cwd: 
         lines = f.readlines()
     for line in lines:
         line = line.strip()
-        if not line or line.startswith("#") or line.startswith("-r "):
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("-r "):
+            nested = (req_path.parent / line.split(maxsplit=1)[1]).resolve()
+            if nested.exists():
+                _install_requirements_best_effort(pip_base, nested, cwd, timeout)
             continue
         # Apply substitutions
         pkg_name = re.split(r"[=<>!~\[]", line)[0].strip()
         if pkg_name in SUBSTITUTIONS:
             line = line.replace(pkg_name, SUBSTITUTIONS[pkg_name], 1)
         # Try installing each line individually, including git+ deps
-        subprocess.run(pip_base + [line], cwd=cwd, capture_output=True, timeout=timeout)
+        r = subprocess.run(pip_base + [line], cwd=cwd, capture_output=True, timeout=timeout)
+        if r.returncode != 0:
+            stderr = r.stderr.decode(errors="replace") if r.stderr else ""
+            print(f"        [WARN] requirement skipped: {line[:100]} :: {stderr[-180:]}")
+
+
+def _coerce_list(value) -> list[str]:
+    if not value:
+        return []
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except json.JSONDecodeError:
+            import ast as _ast
+            parsed = _ast.literal_eval(value)
+        return parsed if isinstance(parsed, list) else []
+    return []
+
+
+def _normalize_test_id(worktree: Path, repo: str, test_id: str) -> str | None:
+    """Map benchmark test identifiers to runnable pytest nodeids on HEAD."""
+    if repo == "django/django":
+        remapped = _remap_django_test_label(worktree, test_id)
+        if len(remapped) == 1:
+            return remapped[0]
+
+        # Already-normalized Django runner labels:
+        #   app.test_module.TestCase.test_method
+        if "::" not in test_id and " " not in test_id:
+            parts = test_id.split(".")
+            if len(parts) >= 3:
+                module = ".".join(parts[:-2])
+                candidate = Path("tests") / (module.replace(".", "/") + ".py")
+                if (worktree / candidate).exists():
+                    return test_id
+        # SWE-bench Django tests often use unittest labels:
+        #   test_name (app_tests.test_module.TestCase)
+        m = re.match(r"(?P<method>[\w_]+) \((?P<qual>[\w.]+)\)$", test_id)
+        if m:
+            qual = m.group("qual")
+            method = m.group("method")
+            module, _, cls = qual.rpartition(".")
+            if module and cls:
+                candidate = Path("tests") / (module.replace(".", "/") + ".py")
+                if (worktree / candidate).exists():
+                    return f"{module}.{cls}.{method}"
+        # Already-normalized pytest-style labels may appear after prior data
+        # processing. Convert them back to Django's dotted runner label.
+        if "::" in test_id:
+            path, *parts = test_id.split("::")
+            if path.startswith("tests/") and path.endswith(".py") and len(parts) >= 2:
+                module = path.removeprefix("tests/").removesuffix(".py").replace("/", ".")
+                if (worktree / path).exists():
+                    return ".".join([module] + parts)
+        return None
+
+    path_part = test_id.split("::", 1)[0]
+    if (worktree / path_part).exists():
+        return test_id
+    return None
+
+
+def _existing_nodeids(worktree: Path, tests: list[str], repo: str = "") -> list[str]:
+    out: list[str] = []
+    python = _find_python(repo, worktree) or PYTHON
+    for t in tests:
+        normalized = _normalize_test_id(worktree, repo, t)
+        if normalized:
+            out.append(normalized)
+            continue
+        if repo == "django/django":
+            remapped = _remap_django_test_label(worktree, t)
+            out.extend(label for label in remapped if label not in out)
+            continue
+        if repo != "django/django":
+            remapped = _remap_pytest_nodeid(worktree, t, python=python)
+            if not remapped:
+                remapped = _static_pytest_nodeid_candidates(worktree, t)
+            out.extend(nodeid for nodeid in remapped if nodeid not in out)
+    return out
+
+
+def _remap_django_test_label(
+    worktree: Path,
+    test_id: str,
+    max_candidates: int = 20,
+) -> list[str]:
+    """Conservatively remap stale Django test labels by class/method.
+
+    Django's runner uses dotted labels under tests/. Historical SWE-bench
+    labels can point at modules that were moved or renamed. To avoid broad
+    false remaps, only return labels when a method/class lookup has a small,
+    exact candidate set.
+    """
+
+    method = ""
+    cls = ""
+
+    m = re.match(r"(?P<method>[\w_]+) \((?P<qual>[\w.]+)\)$", test_id)
+    if m:
+        method = m.group("method")
+        _, _, cls = m.group("qual").rpartition(".")
+    elif "::" in test_id:
+        _path, *selectors = test_id.split("::")
+        if selectors:
+            method = _pytest_selector_function(selectors[-1])
+            if len(selectors) >= 2:
+                cls = selectors[-2].split("[", 1)[0].strip()
+    else:
+        parts = test_id.split(".")
+        if len(parts) >= 2:
+            method = parts[-1]
+            cls = parts[-2] if parts[-2][:1].isupper() else ""
+
+    if not method:
+        return []
+
+    roots = [worktree / "tests"]
+    candidates: list[str] = []
+    class_pattern = re.compile(rf"^\s*class\s+{re.escape(cls)}\b") if cls else None
+    method_pattern = re.compile(rf"^\s*(?:async\s+def|def)\s+{re.escape(method)}\s*\(")
+
+    for root in roots:
+        if not root.exists():
+            continue
+        for path in sorted(root.rglob("*.py")):
+            if len(candidates) >= max_candidates:
+                break
+            try:
+                lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                continue
+
+            method_lines = [idx for idx, line in enumerate(lines) if method_pattern.match(line)]
+            if not method_lines:
+                continue
+
+            if class_pattern:
+                class_lines = [idx for idx, line in enumerate(lines) if class_pattern.match(line)]
+                if not class_lines:
+                    continue
+                # Require the method to appear after the class declaration. This
+                # is intentionally simple and only used to avoid obvious remaps
+                # to the right method name in the wrong class.
+                if not any(method_idx > class_idx for method_idx in method_lines for class_idx in class_lines):
+                    continue
+
+            rel = path.relative_to(worktree / "tests").with_suffix("")
+            module = ".".join(rel.parts)
+            label_parts = [module]
+            if cls:
+                label_parts.append(cls)
+            label_parts.append(method)
+            candidates.append(".".join(label_parts))
+
+    unique = list(dict.fromkeys(candidates))
+    if len(unique) == 1:
+        return unique
+    return []
+
+
+def _remap_pytest_nodeid(
+    worktree: Path,
+    test_id: str,
+    python: str,
+    timeout: int = 60,
+) -> list[str]:
+    """Best-effort remap for stale or truncated pytest nodeids.
+
+    SWE-bench nodeids often drift when test files move or parametrized IDs
+    change. This remapper intentionally stays conservative: it only maps to
+    collected nodeids with the same test function name, and it prefers the
+    original file path or files with the same basename.
+    """
+
+    if not test_id or "::" not in test_id:
+        return []
+
+    path_part, *selectors = test_id.split("::")
+    if not selectors:
+        return []
+
+    target_func = _pytest_selector_function(selectors[-1])
+    if not target_func:
+        return []
+
+    candidate_files = _candidate_pytest_files(worktree, path_part, target_func)
+
+    out: list[str] = []
+    for file_path in candidate_files:
+        if not file_path.exists() or not file_path.is_file():
+            continue
+        rel = str(file_path.relative_to(worktree)).replace("\\", "/")
+        for nodeid in _pytest_collect_nodeids(worktree, rel, python, timeout=timeout):
+            parts = nodeid.split("::")
+            if not parts:
+                continue
+            if _pytest_selector_function(parts[-1]) == target_func:
+                out.append(nodeid)
+    return list(dict.fromkeys(out))
+
+
+def _static_pytest_nodeid_candidates(
+    worktree: Path,
+    test_id: str,
+    max_candidates: int = 40,
+) -> list[str]:
+    """Return conservative runnable-looking nodeids without importing pytest.
+
+    This is used before dependency installation. It prevents moved test files
+    from being misclassified as missing just because pytest collection cannot
+    run yet in the host interpreter.
+    """
+
+    if not test_id or "::" not in test_id:
+        return []
+    path_part, *selectors = test_id.split("::")
+    if not selectors:
+        return []
+
+    target_func = _pytest_selector_function(selectors[-1])
+    if not target_func:
+        return []
+
+    selector_parts = [_pytest_selector_function(part) for part in selectors]
+    selector = "::".join(part for part in selector_parts if part)
+    out: list[str] = []
+    for file_path in _candidate_pytest_files(worktree, path_part, target_func):
+        if len(out) >= max_candidates:
+            break
+        rel = str(file_path.relative_to(worktree)).replace("\\", "/")
+        out.append(f"{rel}::{selector}")
+    return list(dict.fromkeys(out))
+
+
+def _candidate_pytest_files(
+    worktree: Path,
+    path_part: str,
+    target_func: str,
+    max_basename_matches: int = 30,
+    max_symbol_matches: int = 80,
+) -> list[Path]:
+    candidate_files: list[Path] = []
+    original = worktree / path_part
+    if original.exists():
+        candidate_files.append(original)
+        return candidate_files
+
+    basename = Path(path_part).name
+    search_roots = [worktree / "tests", worktree / "test", worktree / "testing"]
+    parts = Path(path_part).parts
+    if parts:
+        package_root = worktree / parts[0]
+        if package_root.exists() and package_root.is_dir():
+            search_roots.append(package_root)
+    search_roots = list(dict.fromkeys(search_roots))
+    for root in search_roots:
+        if root.exists():
+            candidate_files.extend(sorted(root.rglob(basename))[:max_basename_matches])
+
+    if candidate_files:
+        return list(dict.fromkeys(candidate_files))
+
+    needles = (
+        f"def {target_func}(",
+        f"async def {target_func}(",
+    )
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for file_path in sorted(root.rglob("*.py")):
+            if len(candidate_files) >= max_symbol_matches:
+                break
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if any(needle in text for needle in needles):
+                candidate_files.append(file_path)
+        if len(candidate_files) >= max_symbol_matches:
+            break
+
+    return list(dict.fromkeys(candidate_files))
+
+
+def _pytest_selector_function(selector: str) -> str:
+    """Return the function part of a pytest selector, ignoring parameters."""
+
+    selector = selector.split("[", 1)[0]
+    return selector.strip()
+
+
+def _pytest_collect_nodeids(
+    worktree: Path,
+    test_file: str,
+    python: str,
+    timeout: int = 60,
+) -> list[str]:
+    proc = subprocess.run(
+        [python, "-m", "pytest", "--collect-only", "-q", test_file],
+        cwd=worktree,
+        capture_output=True,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        return []
+    output = proc.stdout.decode(errors="replace") + "\n" + proc.stderr.decode(errors="replace")
+    nodeids: list[str] = []
+    for line in output.splitlines():
+        line = line.strip()
+        if "::" in line and not line.startswith("<"):
+            nodeids.append(line)
+    return nodeids
 
 
 def verify_instance(
@@ -315,6 +1047,12 @@ def verify_instance(
     repos_dir: Path,
     worktrees_dir: Path,
     test_timeout: int,
+    check_pass_to_pass: bool = False,
+    max_pass_to_pass: int = 50,
+    check_golden_repair: bool = False,
+    max_target_tests: int | None = None,
+    clean_pass_to_pass: bool = False,
+    require_clean_pass_to_pass: bool = False,
 ) -> dict:
     """Verify a single injected instance."""
 
@@ -324,27 +1062,19 @@ def verify_instance(
     healthy_head = injection_result.get("healthy_head", "")
     patch = original_data.get("patch", "")
 
-    # Test info from original dataset
-    target_test_files = original_data.get("selected_test_files_to_run", [])
-    if isinstance(target_test_files, str):
-        try:
-            target_test_files = json.loads(target_test_files)
-        except json.JSONDecodeError:
-            import ast as _ast
-            target_test_files = _ast.literal_eval(target_test_files)
+    # Test info from original dataset. Prefer fail_to_pass nodeids when present:
+    # running whole files can turn unrelated baseline failures into false negatives.
+    target_test_files = _coerce_list(original_data.get("selected_test_files_to_run", []))
+    injected_fail_to_pass = _coerce_list(injection_result.get("fail_to_pass", []))
+    fail_to_pass_raw = injected_fail_to_pass or _coerce_list(original_data.get("fail_to_pass", []))
+    pass_to_pass_raw = _coerce_list(original_data.get("pass_to_pass", []))
 
-    fail_to_pass_raw = original_data.get("fail_to_pass", [])
-    if isinstance(fail_to_pass_raw, str):
-        try:
-            fail_to_pass_raw = json.loads(fail_to_pass_raw)
-        except json.JSONDecodeError:
-            import ast as _ast
-            fail_to_pass_raw = _ast.literal_eval(fail_to_pass_raw)
+    target_tests_to_run = fail_to_pass_raw or target_test_files
 
     short_id = iid[:60]
     print(f"\n{'━' * 70}")
     print(f"  {short_id}")
-    print(f"  repo={repo}  level={level}  target_tests={len(target_test_files)}")
+    print(f"  repo={repo}  level={level}  target_tests={len(target_tests_to_run)}")
     print(f"  expected fail_to_pass: {len(fail_to_pass_raw)} test(s)")
     print(f"{'━' * 70}")
 
@@ -355,7 +1085,7 @@ def verify_instance(
         "verification": None,
     }
 
-    if not target_test_files:
+    if not target_tests_to_run:
         print(f"  [SKIP] No target test files")
         result["verification"] = {"status": "skipped", "reason": "no_target_tests"}
         return result
@@ -376,53 +1106,161 @@ def verify_instance(
         if r.returncode == 0:
             default_branch = bn
             break
+    ensure_repo_head(repo_dir, default_branch)
 
-    # Create worktree
-    wt_name = f"verify-{repo.replace('/', '-')}-{iid[-8:]}"
+    # Create worktree. Use a hash of the full instance id because many
+    # SWE-bench Pro ids share the same trailing commit suffix.
+    run_key = _stable_id_suffix(repo, iid)
+    wt_name = f"verify-{repo.replace('/', '-')}-{run_key}"
     wt_path = (worktrees_dir / wt_name).resolve()
-    if wt_path.exists():
-        git("worktree", "remove", "--force", str(wt_path), cwd=str(repo_dir))
-        shutil.rmtree(wt_path, ignore_errors=True)
-
-    branch = f"vfy-{iid[-8:]}"
-    git("branch", "-D", branch, cwd=str(repo_dir))
-    r = git("worktree", "add", "-b", branch, str(wt_path), f"origin/{default_branch}",
-            cwd=str(repo_dir), timeout=1200)
+    branch = f"vfy-{run_key}"
+    r = None
+    for attempt in range(2):
+        cleanup_worktree_branch(repo_dir, branch, wt_path)
+        r = git("worktree", "add", "-b", branch, str(wt_path), f"origin/{default_branch}",
+                cwd=str(repo_dir), timeout=1200)
+        if r.returncode == 0:
+            break
     if r.returncode != 0:
-        print(f"  [SKIP] Worktree creation failed")
-        result["verification"] = {"status": "skipped", "reason": "worktree_failed"}
+        stderr = r.stderr.decode(errors="replace") if r.stderr else ""
+        print(f"  [SKIP] Worktree creation failed: {stderr[-300:]}")
+        result["verification"] = {
+            "status": "skipped",
+            "reason": "worktree_failed",
+            "stderr_tail": stderr[-500:],
+        }
         return result
 
     start_time = time.monotonic()
 
     try:
-        # Check which test files exist
-        existing_tests = [t for t in target_test_files if (wt_path / t).exists()]
+        # Check which test files exist. Pytest nodeids include "::"; only the path
+        # component should be checked on disk.
+        existing_tests = _existing_nodeids(wt_path, target_tests_to_run, repo)
         if not existing_tests:
             print(f"  [SKIP] No target test files exist on HEAD")
             result["verification"] = {"status": "skipped", "reason": "test_files_missing"}
+            return result
+        if max_target_tests is not None and len(existing_tests) > max_target_tests:
+            print(
+                "  [SKIP] Too many target tests "
+                f"({len(existing_tests)} > {max_target_tests})"
+            )
+            result["verification"] = {
+                "status": "skipped",
+                "reason": "too_many_target_tests",
+                "target_test_count": len(existing_tests),
+                "max_target_tests": max_target_tests,
+            }
             return result
 
         print(f"  Target tests: {existing_tests}")
 
         # Create isolated venv for this worktree
         print(f"  [0/3] Creating isolated venv & installing dependencies...")
-        venv_python = _create_venv(str(wt_path))
+        venv_python = _create_venv(str(wt_path), repo)
+        if not venv_python:
+            result["verification"] = {
+                "status": "skipped",
+                "reason": "python_version_unavailable",
+                "requires_python": _read_requires_python(wt_path),
+            }
+            return result
         install_ok = _install_project(str(wt_path), repo, test_timeout,
                                       python=venv_python, test_files=existing_tests)
         if not install_ok:
             print(f"  [WARN] Dependency install may have issues, proceeding anyway")
+        if not _test_runner_available(str(wt_path), repo, venv_python):
+            print("  [SKIP] Test runner is unavailable after dependency installation")
+            result["verification"] = {
+                "status": "skipped",
+                "reason": "test_runner_unavailable",
+                "healthy_pass": False,
+            }
+            return result
+        existing_tests = _collectable_tests(
+            str(wt_path), repo, existing_tests, venv_python
+        )
+        if not existing_tests:
+            print("  [SKIP] No target test nodeids are collectable on HEAD")
+            result["verification"] = {
+                "status": "skipped",
+                "reason": "target_nodeids_not_collectable",
+                "healthy_pass": False,
+            }
+            return result
+        print(f"  Collectable target tests: {existing_tests}")
+
+        p2p_existing_tests: list[str] = []
+        p2p_healthy_failed_tests: list[str] = []
+        if check_pass_to_pass and pass_to_pass_raw:
+            p2p_existing_tests = _existing_nodeids(
+                wt_path, pass_to_pass_raw, repo
+            )[:max_pass_to_pass]
+            if p2p_existing_tests:
+                p2p_existing_tests = _collectable_tests(
+                    str(wt_path), repo, p2p_existing_tests, venv_python
+                )
+                if max_pass_to_pass is not None:
+                    p2p_existing_tests = p2p_existing_tests[:max_pass_to_pass]
+                if clean_pass_to_pass and p2p_existing_tests:
+                    print(
+                        "  [p2p-clean] Healthy filter: running "
+                        f"{len(p2p_existing_tests)} pass_to_pass tests individually..."
+                    )
+                    p2p_existing_tests, p2p_healthy_failed_tests = _filter_passing_tests(
+                        str(wt_path), repo, p2p_existing_tests,
+                        python=venv_python, timeout=test_timeout
+                    )
+                    print(
+                        f"        healthy-clean={len(p2p_existing_tests)} "
+                        f"healthy-failed={len(p2p_healthy_failed_tests)}"
+                    )
 
         # ── Step 1: Healthy check (target tests should PASS) ──
         print(f"  [1/3] Healthy check: running target tests on clean HEAD...")
-        healthy_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout, python=venv_python)
-        healthy_pass = healthy_result["returncode"] == 0
+        healthy_result = run_repo_tests(str(wt_path), repo, existing_tests,
+                                        timeout=test_timeout, python=venv_python)
+        healthy_executed = int(healthy_result.get("total") or 0) > 0
+        target_healthy_minimized_from_failure = False
+        target_healthy_failed_tests: list[str] = []
+        if healthy_result["returncode"] != 0 and healthy_executed and len(existing_tests) > 1:
+            print(
+                "  [target-clean] Healthy target group failed; "
+                "minimizing to individually passing target tests..."
+            )
+            passing, failing = _filter_passing_tests(
+                str(wt_path), repo, existing_tests,
+                python=venv_python, timeout=test_timeout
+            )
+            target_healthy_failed_tests = failing
+            if passing:
+                existing_tests = passing[:max_target_tests] if max_target_tests is not None else passing
+                healthy_result = run_repo_tests(
+                    str(wt_path), repo, existing_tests,
+                    timeout=test_timeout, python=venv_python
+                )
+                healthy_executed = int(healthy_result.get("total") or 0) > 0
+                target_healthy_minimized_from_failure = True
+        healthy_pass = healthy_result["returncode"] == 0 and healthy_executed
         print(f"        rc={healthy_result['returncode']} passed={healthy_result['passed']} "
               f"failed={healthy_result['failed']} → {'PASS' if healthy_pass else 'FAIL'}")
 
         if not healthy_pass:
             print(f"  [WARN] Target tests already fail on healthy HEAD!")
             print(f"         {healthy_result['output_tail'][-300:]}")
+            result["verification"] = {
+                "status": "baseline_failed",
+                "reason": "healthy_target_failed" if healthy_executed else "healthy_target_not_executed",
+                "healthy_pass": False,
+                "healthy_result": healthy_result,
+                "target_tests": existing_tests,
+                "target_test_count": len(existing_tests),
+                "target_healthy_minimized_from_failure": target_healthy_minimized_from_failure,
+                "target_healthy_failed_tests": target_healthy_failed_tests[:10],
+                "pass_to_fail": False,
+            }
+            return result
 
         # ── Step 2: Apply saved diff ──
         print(f"  [2/3] Applying saved diff...")
@@ -456,10 +1294,108 @@ def verify_instance(
 
         # ── Step 3: Pass-to-fail check (target tests should FAIL) ──
         print(f"  [3/3] P2F check: running target tests on buggy revision...")
-        buggy_result = run_pytest(str(wt_path), existing_tests, timeout=test_timeout, python=venv_python)
-        target_failed = buggy_result["returncode"] != 0
+        buggy_result = run_repo_tests(str(wt_path), repo, existing_tests,
+                                      timeout=test_timeout, python=venv_python)
+        buggy_executed = int(buggy_result.get("total") or 0) > 0
+        target_failed = buggy_result["returncode"] != 0 and buggy_executed
         print(f"        rc={buggy_result['returncode']} passed={buggy_result['passed']} "
               f"failed={buggy_result['failed']} → {'FAIL (good!)' if target_failed else 'PASS (bad!)'}")
+
+        p2p_buggy_result = None
+        repaired_result = None
+        p2p_repaired_result = None
+        p2p_buggy_failed_tests: list[str] = []
+        p2p_repaired_failed_tests: list[str] = []
+        clean_p2p_tests: list[str] = []
+        no_regression = None
+        golden_repair_pass = None
+        p2p_repaired_pass = None
+        if check_pass_to_pass and healthy_pass and target_failed:
+            if p2p_existing_tests:
+                print(
+                    "  [4/4] No-regression check: running "
+                    f"{len(p2p_existing_tests)} pass_to_pass tests..."
+                )
+                if clean_pass_to_pass:
+                    clean_p2p_tests, p2p_buggy_failed_tests = _filter_passing_tests(
+                        str(wt_path), repo, p2p_existing_tests,
+                        python=venv_python, timeout=test_timeout
+                    )
+                    p2p_buggy_result = {
+                        "returncode": 0 if len(clean_p2p_tests) == len(p2p_existing_tests) else 1,
+                        "passed": len(clean_p2p_tests),
+                        "failed": len(p2p_buggy_failed_tests),
+                        "total": len(p2p_existing_tests),
+                        "failed_tests": p2p_buggy_failed_tests,
+                    }
+                    no_regression = len(p2p_buggy_failed_tests) == 0
+                    print(
+                        f"        buggy-clean={len(clean_p2p_tests)} "
+                        f"buggy-failed={len(p2p_buggy_failed_tests)}"
+                    )
+                else:
+                    p2p_buggy_result = run_repo_tests(
+                        str(wt_path), repo, p2p_existing_tests,
+                        timeout=test_timeout, python=venv_python
+                    )
+                    no_regression = p2p_buggy_result["returncode"] == 0
+                    clean_p2p_tests = p2p_existing_tests if no_regression else []
+                    print(f"        rc={p2p_buggy_result['returncode']} passed={p2p_buggy_result['passed']} "
+                          f"failed={p2p_buggy_result['failed']} → {'PASS' if no_regression else 'FAIL'}")
+            elif require_clean_pass_to_pass:
+                no_regression = False
+
+        if check_golden_repair and healthy_pass and target_failed:
+            print("  [repair] Applying golden repair by reversing injected diff...")
+            proc = subprocess.run(
+                ["git", "apply", "-R", str(diff_path)],
+                cwd=str(wt_path),
+                capture_output=True, timeout=30,
+            )
+            if proc.returncode != 0:
+                err = proc.stderr.decode(errors="replace")[:200]
+                print(f"        golden repair apply failed: {err}")
+                golden_repair_pass = False
+            else:
+                repaired_result = run_repo_tests(
+                    str(wt_path), repo, existing_tests,
+                    timeout=test_timeout, python=venv_python
+                )
+                repaired_executed = int(repaired_result.get("total") or 0) > 0
+                golden_repair_pass = repaired_result["returncode"] == 0 and repaired_executed
+                print(f"        target rc={repaired_result['returncode']} "
+                      f"passed={repaired_result['passed']} failed={repaired_result['failed']} "
+                      f"→ {'PASS' if golden_repair_pass else 'FAIL'}")
+                if clean_p2p_tests:
+                    if clean_pass_to_pass:
+                        clean_p2p_tests, p2p_repaired_failed_tests = _filter_passing_tests(
+                            str(wt_path), repo, clean_p2p_tests,
+                            python=venv_python, timeout=test_timeout
+                        )
+                        p2p_repaired_result = {
+                            "returncode": 0 if not p2p_repaired_failed_tests else 1,
+                            "passed": len(clean_p2p_tests),
+                            "failed": len(p2p_repaired_failed_tests),
+                            "total": len(clean_p2p_tests) + len(p2p_repaired_failed_tests),
+                            "failed_tests": p2p_repaired_failed_tests,
+                        }
+                        p2p_repaired_pass = len(p2p_repaired_failed_tests) == 0 and bool(clean_p2p_tests)
+                        print(
+                            f"        p2p repaired-clean={len(clean_p2p_tests)} "
+                            f"repaired-failed={len(p2p_repaired_failed_tests)}"
+                        )
+                    else:
+                        p2p_repaired_result = run_repo_tests(
+                            str(wt_path), repo, clean_p2p_tests,
+                            timeout=test_timeout, python=venv_python
+                        )
+                        p2p_repaired_pass = p2p_repaired_result["returncode"] == 0
+                        print(f"        p2p rc={p2p_repaired_result['returncode']} "
+                              f"passed={p2p_repaired_result['passed']} "
+                              f"failed={p2p_repaired_result['failed']} "
+                              f"→ {'PASS' if p2p_repaired_pass else 'FAIL'}")
+                elif require_clean_pass_to_pass:
+                    p2p_repaired_pass = False
 
         # Check if the specific expected tests failed
         expected_fails = set()
@@ -484,6 +1420,8 @@ def verify_instance(
             "healthy_pass": healthy_pass,
             "target_tests_failed": target_failed,
             "pass_to_fail": target_failed and healthy_pass,
+            "target_healthy_minimized_from_failure": target_healthy_minimized_from_failure,
+            "target_healthy_failed_tests": target_healthy_failed_tests[:10],
             "healthy_passed": healthy_result["passed"],
             "healthy_failed": healthy_result["failed"],
             "buggy_passed": buggy_result["passed"],
@@ -493,6 +1431,28 @@ def verify_instance(
             "expected_matched": expected_matched,
             "actual_failed_tests": buggy_result.get("failed_tests", [])[:10],
             "duration_seconds": round(duration, 2),
+            "pass_to_pass_checked": bool(p2p_existing_tests),
+            "pass_to_pass_test_count": len(p2p_existing_tests),
+            "no_regression": no_regression,
+            "clean_pass_to_pass": clean_p2p_tests,
+            "clean_pass_to_pass_count": len(clean_p2p_tests),
+            "p2p_healthy_failed_tests": p2p_healthy_failed_tests[:10],
+            "p2p_buggy_passed": p2p_buggy_result["passed"] if p2p_buggy_result else 0,
+            "p2p_buggy_failed": p2p_buggy_result["failed"] if p2p_buggy_result else 0,
+            "p2p_buggy_failed_tests": (
+                p2p_buggy_result.get("failed_tests", [])[:10] if p2p_buggy_result else []
+            ),
+            "golden_repair_checked": bool(check_golden_repair and healthy_pass and target_failed),
+            "golden_repair_pass": golden_repair_pass,
+            "repaired_passed": repaired_result["passed"] if repaired_result else 0,
+            "repaired_failed": repaired_result["failed"] if repaired_result else 0,
+            "repaired_failed_tests": (
+                repaired_result.get("failed_tests", [])[:10] if repaired_result else []
+            ),
+            "p2p_repaired_pass": p2p_repaired_pass,
+            "p2p_repaired_passed": p2p_repaired_result["passed"] if p2p_repaired_result else 0,
+            "p2p_repaired_failed": p2p_repaired_result["failed"] if p2p_repaired_result else 0,
+            "p2p_repaired_failed_tests": p2p_repaired_failed_tests[:10],
         }
 
         p2f_ok = target_failed and healthy_pass
@@ -523,6 +1483,20 @@ def main():
     parser.add_argument("--max", "-n", type=int, default=None)
     parser.add_argument("--repos-dir", default=".pri-workspace/repos")
     parser.add_argument("--worktrees-dir", default=".pri-workspace/worktrees")
+    parser.add_argument("--check-pass-to-pass", action="store_true",
+                        help="Run pass_to_pass tests on the injected revision after P2F succeeds")
+    parser.add_argument("--clean-pass-to-pass", action="store_true",
+                        help="Filter pass_to_pass tests through healthy, buggy, and repaired states individually")
+    parser.add_argument("--require-clean-pass-to-pass", action="store_true",
+                        help="Require at least one pass_to_pass test to pass in all checked states")
+    parser.add_argument("--max-pass-to-pass", type=int, default=50,
+                        help="Maximum pass_to_pass nodeids to run per instance")
+    parser.add_argument("--check-golden-repair", action="store_true",
+                        help="After P2F, reverse the injected diff and run target tests again")
+    parser.add_argument("--max-target-tests", type=int, default=None,
+                        help="Skip instances with more target nodeids than this")
+    parser.add_argument("--force", action="store_true",
+                        help="Re-run instances even if an output verification row already exists")
     args = parser.parse_args()
 
     # Setup log file (tee stdout to file)
@@ -554,19 +1528,40 @@ def main():
     print(f"Instances to verify: {len(to_verify)}")
     print(f"Output: {args.output}")
 
-    results = []
-    stats = {"total": 0, "p2f_confirmed": 0, "p2f_failed": 0,
-             "healthy_already_fail": 0, "skipped": 0}
+    results_by_id: dict[str, dict] = {}
+    if output_path.exists() and not args.force:
+        with open(output_path, encoding="utf-8") as f:
+            for line in f:
+                if line.strip():
+                    row = json.loads(line)
+                    if row.get("instance_id"):
+                        results_by_id[row["instance_id"]] = row
 
     for i, inj in enumerate(to_verify, 1):
         iid = inj["instance_id"]
         orig = sampled.get(iid, {})
 
         print(f"\n[{i}/{len(to_verify)}]", end="")
-        stats["total"] += 1
+        if iid in results_by_id and not args.force:
+            existing = results_by_id[iid]
+            verification = existing.get("verification") or {}
+            print(
+                f"  [SKIP existing] {iid[:60]} "
+                f"status={verification.get('status')} p2f={verification.get('pass_to_fail')}",
+                flush=True,
+            )
+            continue
 
         try:
-            result = verify_instance(inj, orig, repos_dir, worktrees_dir, args.timeout)
+            result = verify_instance(
+                inj, orig, repos_dir, worktrees_dir, args.timeout,
+                check_pass_to_pass=args.check_pass_to_pass,
+                max_pass_to_pass=args.max_pass_to_pass,
+                check_golden_repair=args.check_golden_repair,
+                max_target_tests=args.max_target_tests,
+                clean_pass_to_pass=args.clean_pass_to_pass,
+                require_clean_pass_to_pass=args.require_clean_pass_to_pass,
+            )
         except Exception as e:
             print(f"  [ERROR] {e}")
             result = {
@@ -575,6 +1570,24 @@ def main():
                 "verification": {"status": "error", "error": str(e)[:300]},
             }
 
+        results_by_id[iid] = result
+
+        # Incremental save
+        with open(args.output, "w", encoding="utf-8") as f:
+            for inj_out in to_verify:
+                r = results_by_id.get(inj_out["instance_id"])
+                if r is not None:
+                    f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+
+    # Summary
+    final_rows = [
+        results_by_id[inj["instance_id"]]
+        for inj in to_verify
+        if inj["instance_id"] in results_by_id
+    ]
+    stats = {"total": len(final_rows), "p2f_confirmed": 0, "p2f_failed": 0,
+             "healthy_already_fail": 0, "skipped": 0}
+    for result in final_rows:
         v = result.get("verification", {})
         if v.get("status") == "skipped":
             stats["skipped"] += 1
@@ -584,15 +1597,6 @@ def main():
             stats["healthy_already_fail"] += 1
         elif v.get("status") == "completed":
             stats["p2f_failed"] += 1
-
-        results.append(result)
-
-        # Incremental save
-        with open(args.output, "w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
-
-    # Summary
     t = stats["total"]
     verified = stats["p2f_confirmed"] + stats["p2f_failed"] + stats["healthy_already_fail"]
     print(f"\n\n{'=' * 70}")

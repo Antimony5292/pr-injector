@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from pr_injector.core.diff_parser import extract_source_diff, is_test_file, parse_diff
 from pr_injector.core.exceptions import (
     ArchitectureDeprecated,
@@ -51,6 +53,16 @@ class PRResolver:
             ArchitectureDeprecated: Level 4 - feature/dependency removed.
             SemanticInjectionFailed: LLM could not produce valid injection.
         """
+        if os.environ.get("PRI_ALLOW_L3_MODEL_CALLS", "").lower() not in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }:
+            raise SemanticInjectionFailed(
+                "Level 3 disabled: PRI_ALLOW_L3_MODEL_CALLS is not enabled"
+            )
+
         # Check for Level 4: Architecture Deprecated
         await self._check_architecture_deprecated(candidate, repo_path)
 

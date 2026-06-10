@@ -222,7 +222,7 @@ class PipelineOrchestrator:
             if injection_result is None:
                 return None
 
-            level, injected_diff, golden_patch, worktree_path = injection_result
+            level, injected_diff, golden_patch, worktree_path, quality_metadata = injection_result
 
             # Get the original diff for test_patch extraction
             try:
@@ -264,6 +264,7 @@ class PipelineOrchestrator:
                 golden_patch=golden_patch,
                 test_patch=test_patch,
                 verification=verification,
+                quality_metadata=quality_metadata,
             )
 
             return instance
@@ -278,7 +279,7 @@ class PipelineOrchestrator:
         candidate: CandidatePR,
         repo_path: str,
         strategy: InjectionStrategy,
-    ) -> tuple[InjectionLevel, str, str, str] | None:
+    ) -> tuple[InjectionLevel, str, str, str, dict] | None:
         """Run injection stages based on strategy.
 
         Returns (level, injected_diff, golden_patch, worktree_path) or None.
@@ -300,6 +301,11 @@ class PipelineOrchestrator:
                     result.injected_diff,
                     result.golden_patch,
                     result.worktree_path,
+                    {
+                        "conflict_files": result.conflict_files,
+                        "compatibility_reports": result.compatibility_reports,
+                        **result.quality_metadata,
+                    },
                 )
             except RevertFailed as e:
                 logger.info("revert_failed", pr=pr_num, error=str(e)[:200])
@@ -321,6 +327,12 @@ class PipelineOrchestrator:
                     result.injected_diff,
                     result.golden_patch,
                     result.worktree_path,
+                    {
+                        "model_used": result.model_used,
+                        "prompt_tokens": result.prompt_tokens,
+                        "completion_tokens": result.completion_tokens,
+                        "confidence_score": result.confidence_score,
+                    },
                 )
             except ArchitectureDeprecated:
                 self.stats["level_4_deprecated"] += 1
