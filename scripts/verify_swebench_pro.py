@@ -49,8 +49,8 @@ class _Tee:
 
 PYTHON = sys.executable
 BUNDLED_PYTHON_312 = Path(
-    os.environ.get("CODEX_BUNDLED_PYTHON", sys.executable)
-).expanduser()
+    "/Users/harmin/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
+)
 
 
 def _stable_id_suffix(*parts: str, length: int = 12) -> str:
@@ -408,9 +408,32 @@ def run_repo_tests(
     timeout: int = 300,
     python: str | None = None,
 ) -> dict:
+    started = time.monotonic()
     if repo == "django/django":
-        return run_django_tests(cwd, tests, timeout=timeout, python=python)
-    return run_pytest(cwd, tests, timeout=timeout, python=python)
+        result = run_django_tests(cwd, tests, timeout=timeout, python=python)
+    else:
+        result = run_pytest(cwd, tests, timeout=timeout, python=python)
+    result["duration_seconds"] = round(time.monotonic() - started, 3)
+    result["command_count"] = 1
+    result["nodeid_count"] = len(tests)
+    return result
+
+
+def _record_test_metrics(metrics: dict | None, phase: str, tests: list[str], result: dict) -> None:
+    if metrics is None:
+        return
+    metrics["test_command_count"] = int(metrics.get("test_command_count") or 0) + 1
+    metrics["test_nodeid_count"] = int(metrics.get("test_nodeid_count") or 0) + len(tests)
+    by_phase = metrics.setdefault("test_command_count_by_phase", {})
+    by_phase[phase] = int(by_phase.get(phase) or 0) + 1
+    nodeids_by_phase = metrics.setdefault("test_nodeid_count_by_phase", {})
+    nodeids_by_phase[phase] = int(nodeids_by_phase.get(phase) or 0) + len(tests)
+    duration_by_phase = metrics.setdefault("test_command_duration_seconds_by_phase", {})
+    duration_by_phase[phase] = round(
+        float(duration_by_phase.get(phase) or 0.0)
+        + float(result.get("duration_seconds") or 0.0),
+        3,
+    )
 
 
 def _test_runner_available(worktree: str, repo: str, python: str) -> bool:
@@ -449,6 +472,10 @@ def _collectable_tests(
             continue
 
         remapped = _remap_pytest_nodeid(Path(worktree), test, python, timeout=timeout)
+        if not remapped:
+            remapped = _static_pytest_nodeid_candidates(Path(worktree), test)
+        if not remapped:
+            remapped = _target_execution_fallback_tests(Path(worktree), repo, [test], python)
         for nodeid in remapped:
             if nodeid in collectable:
                 continue
@@ -460,7 +487,102 @@ def _collectable_tests(
             )
             if check.returncode == 0:
                 collectable.append(nodeid)
+            elif (
+                os.environ.get("PRI_ALLOW_STATIC_TARGET_FALLBACK", "1").lower()
+                in {"1", "true", "yes", "on"}
+                and nodeid not in collectable
+                    and (Path(worktree) / nodeid.split("::", 1)[0]).exists()
+            ):
+                # Some modern projects fail pytest collection for an exact
+                # historical parametrized id even though the broader function
+                # remains runnable. Let the healthy-target run below be the
+                # authoritative gate instead of discarding the candidate here.
+                collectable.append(nodeid)
     return collectable
+
+
+def _target_execution_fallback_tests(
+    worktree: Path,
+    repo: str,
+    tests: list[str],
+    python: str | None = None,
+    max_candidates: int = 20,
+) -> list[str]:
+    """Return narrow fallback tests when stale exact nodeids execute zero tests.
+
+    This is deliberately conservative: it stays within likely test files and
+    prefers the same test function. It is used only before the healthy/baseline
+    gate, so a bad fallback still has to pass on healthy HEAD and later satisfy
+    P2F/P2P/golden repair verification.
+    """
+
+    out: list[str] = []
+    for test in tests:
+        if len(out) >= max_candidates:
+            break
+        if repo == "django/django":
+            for label in _remap_django_test_label(worktree, test, max_candidates=max_candidates):
+                if label not in out:
+                    out.append(label)
+            continue
+        if "::" not in test:
+            continue
+        path_part, *selectors = test.split("::")
+        if not selectors:
+            continue
+        target_func = _pytest_selector_function(selectors[-1])
+        if not target_func:
+            continue
+        py = python or _find_python(repo, worktree) or PYTHON
+        candidates: list[str] = []
+        for file_path in _candidate_pytest_files(worktree, path_part, target_func):
+            if len(candidates) >= max_candidates:
+                break
+            if not file_path.exists() or not file_path.is_file():
+                continue
+            rel = str(file_path.relative_to(worktree)).replace("\\", "/")
+            collected = _pytest_collect_nodeids(worktree, rel, py)
+            matches = [
+                nodeid for nodeid in collected
+                if _pytest_selector_function(nodeid.split("::")[-1]) == target_func
+            ]
+            if matches:
+                candidates.extend(matches)
+                continue
+            selector_parts = [_pytest_selector_function(part) for part in selectors]
+            selector = "::".join(part for part in selector_parts if part)
+            if selector:
+                candidates.append(f"{rel}::{selector}")
+            candidates.append(f"{rel}::{target_func}")
+            # Last resort: the containing file can still be useful when the
+            # exact parametrized/class nodeid drifted. The target/P2F gate below
+            # decides whether it is a valid benchmark target.
+            candidates.append(rel)
+        for candidate in candidates:
+            if candidate not in out:
+                out.append(candidate)
+            if len(out) >= max_candidates:
+                break
+    return out
+
+
+def _retry_with_target_execution_fallback(
+    cwd: str,
+    repo: str,
+    tests: list[str],
+    python: str,
+    timeout: int,
+    metrics: dict | None = None,
+    phase: str = "target_execution_fallback",
+) -> tuple[list[str], dict]:
+    fallback_tests = _target_execution_fallback_tests(Path(cwd), repo, tests, python)
+    if not fallback_tests or fallback_tests == tests:
+        return tests, {}
+    result = run_repo_tests(cwd, repo, fallback_tests, timeout=timeout, python=python)
+    _record_test_metrics(metrics, phase, fallback_tests, result)
+    if int(result.get("total") or 0) > 0:
+        return fallback_tests, result
+    return tests, result
 
 
 def _filter_passing_tests(
@@ -469,12 +591,15 @@ def _filter_passing_tests(
     tests: list[str],
     python: str,
     timeout: int,
+    metrics: dict | None = None,
+    phase: str = "filter_passing",
 ) -> tuple[list[str], list[str]]:
     """Return tests that pass when run individually and tests that do not."""
     passing: list[str] = []
     failing: list[str] = []
     for test in tests:
         result = run_repo_tests(cwd, repo, [test], timeout=timeout, python=python)
+        _record_test_metrics(metrics, phase, [test], result)
         if result["returncode"] == 0 and int(result.get("total") or 0) > 0:
             passing.append(test)
         else:
@@ -639,10 +764,15 @@ def _install_project(worktree: str, repo: str, timeout: int = 300, python: str |
             "xvfb_width": "pytest-xvfb",
             "xvfb_height": "pytest-xvfb",
             "mypy_pyproject_toml_file": "pytest-mypy-plugins",
+            "asyncio_default_fixture_loop_scope": "pytest-asyncio",
+            "asyncio_default_test_loop_scope": "pytest-asyncio",
+            "asyncio_mode": "pytest-asyncio",
         }
         for opt in unknown_opts:
             if opt in CONFIG_TO_PLUGIN:
                 missing_plugins.append(CONFIG_TO_PLUGIN[opt])
+        if "'asyncio' not found in `markers`" in combined:
+            missing_plugins.append("pytest-asyncio")
 
         unrecognized_args = re.findall(r"unrecognized arguments?: ([^\n]+)", combined)
         for arg_line in unrecognized_args:
@@ -1008,6 +1138,32 @@ def _candidate_pytest_files(
         if len(candidate_files) >= max_symbol_matches:
             break
 
+    if not candidate_files:
+        skip_parts = {
+            ".git",
+            ".hg",
+            ".tox",
+            ".venv",
+            "venv",
+            "__pycache__",
+            "site-packages",
+            "build",
+            "dist",
+            "node_modules",
+        }
+        for file_path in sorted(worktree.rglob("*.py")):
+            if len(candidate_files) >= max_symbol_matches:
+                break
+            rel_parts = set(file_path.relative_to(worktree).parts)
+            if rel_parts & skip_parts:
+                continue
+            try:
+                text = file_path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            if any(needle in text for needle in needles):
+                candidate_files.append(file_path)
+
     return list(dict.fromkeys(candidate_files))
 
 
@@ -1041,6 +1197,54 @@ def _pytest_collect_nodeids(
     return nodeids
 
 
+def _adjacent_pass_to_pass_candidates(
+    worktree: Path,
+    repo: str,
+    target_tests: list[str],
+    existing_pass_to_pass: list[str],
+    python: str,
+    max_tests: int = 25,
+    timeout: int = 60,
+) -> list[str]:
+    """Collect extra nearby tests to make injected-task P2P less local.
+
+    The goal is not broad full-suite coverage; it is to add adjacent behavior
+    from the same test files/directories as the injected failure while avoiding
+    the FAIL_TO_PASS nodeids themselves. Django's dotted labels need separate
+    runner semantics, so this conservative helper currently targets pytest
+    nodeids only.
+    """
+
+    if max_tests <= 0 or repo == "django/django":
+        return []
+
+    target_set = set(target_tests)
+    existing_set = set(existing_pass_to_pass)
+    candidate_files: list[str] = []
+    for nodeid in target_tests:
+        path = nodeid.split("::", 1)[0]
+        if path.endswith(".py") and (worktree / path).exists():
+            candidate_files.append(path)
+
+    for path in list(candidate_files):
+        parent = (worktree / path).parent
+        if not parent.exists():
+            continue
+        for sibling in sorted(parent.glob("test*.py"))[:12]:
+            rel = str(sibling.relative_to(worktree)).replace("\\", "/")
+            candidate_files.append(rel)
+
+    out: list[str] = []
+    for rel in list(dict.fromkeys(candidate_files)):
+        for nodeid in _pytest_collect_nodeids(worktree, rel, python, timeout=timeout):
+            if nodeid in target_set or nodeid in existing_set or nodeid in out:
+                continue
+            out.append(nodeid)
+            if len(out) >= max_tests:
+                return out
+    return out
+
+
 def verify_instance(
     injection_result: dict,
     original_data: dict,
@@ -1053,6 +1257,8 @@ def verify_instance(
     max_target_tests: int | None = None,
     clean_pass_to_pass: bool = False,
     require_clean_pass_to_pass: bool = False,
+    include_adjacent_pass_to_pass: bool = True,
+    max_adjacent_pass_to_pass: int = 25,
 ) -> dict:
     """Verify a single injected instance."""
 
@@ -1132,29 +1338,20 @@ def verify_instance(
         return result
 
     start_time = time.monotonic()
+    test_metrics: dict = {
+        "test_command_count": 0,
+        "test_nodeid_count": 0,
+        "test_command_count_by_phase": {},
+        "test_nodeid_count_by_phase": {},
+        "test_command_duration_seconds_by_phase": {},
+    }
 
     try:
         # Check which test files exist. Pytest nodeids include "::"; only the path
         # component should be checked on disk.
-        existing_tests = _existing_nodeids(wt_path, target_tests_to_run, repo)
-        if not existing_tests:
-            print(f"  [SKIP] No target test files exist on HEAD")
-            result["verification"] = {"status": "skipped", "reason": "test_files_missing"}
-            return result
-        if max_target_tests is not None and len(existing_tests) > max_target_tests:
-            print(
-                "  [SKIP] Too many target tests "
-                f"({len(existing_tests)} > {max_target_tests})"
-            )
-            result["verification"] = {
-                "status": "skipped",
-                "reason": "too_many_target_tests",
-                "target_test_count": len(existing_tests),
-                "max_target_tests": max_target_tests,
-            }
-            return result
-
-        print(f"  Target tests: {existing_tests}")
+        initial_existing_tests = _existing_nodeids(wt_path, target_tests_to_run, repo)
+        tests_for_collect = initial_existing_tests or target_tests_to_run
+        print(f"  Target tests: {tests_for_collect}")
 
         # Create isolated venv for this worktree
         print(f"  [0/3] Creating isolated venv & installing dependencies...")
@@ -1167,7 +1364,7 @@ def verify_instance(
             }
             return result
         install_ok = _install_project(str(wt_path), repo, test_timeout,
-                                      python=venv_python, test_files=existing_tests)
+                                      python=venv_python, test_files=tests_for_collect)
         if not install_ok:
             print(f"  [WARN] Dependency install may have issues, proceeding anyway")
         if not _test_runner_available(str(wt_path), repo, venv_python):
@@ -1179,49 +1376,117 @@ def verify_instance(
             }
             return result
         existing_tests = _collectable_tests(
-            str(wt_path), repo, existing_tests, venv_python
+            str(wt_path), repo, tests_for_collect, venv_python
         )
         if not existing_tests:
             print("  [SKIP] No target test nodeids are collectable on HEAD")
             result["verification"] = {
                 "status": "skipped",
-                "reason": "target_nodeids_not_collectable",
+                "reason": "target_nodeids_not_collectable"
+                if initial_existing_tests else "target_nodeids_not_remappable",
                 "healthy_pass": False,
+                "raw_target_tests": target_tests_to_run,
+                "initial_existing_target_tests": initial_existing_tests,
+                "test_metrics": test_metrics,
+            }
+            return result
+        if not initial_existing_tests:
+            print(
+                "  [target-remap] Target nodeids remapped: "
+                f"{len(target_tests_to_run)} raw → {len(existing_tests)} collectable"
+            )
+        if max_target_tests is not None and len(existing_tests) > max_target_tests:
+            print(
+                "  [SKIP] Too many collectable target tests "
+                f"({len(existing_tests)} > {max_target_tests})"
+            )
+            result["verification"] = {
+                "status": "skipped",
+                "reason": "too_many_target_tests",
+                "target_test_count": len(existing_tests),
+                "max_target_tests": max_target_tests,
+                "collectable_target_tests": existing_tests[:20],
+                "test_metrics": test_metrics,
             }
             return result
         print(f"  Collectable target tests: {existing_tests}")
 
         p2p_existing_tests: list[str] = []
         p2p_healthy_failed_tests: list[str] = []
-        if check_pass_to_pass and pass_to_pass_raw:
-            p2p_existing_tests = _existing_nodeids(
-                wt_path, pass_to_pass_raw, repo
-            )[:max_pass_to_pass]
-            if p2p_existing_tests:
-                p2p_existing_tests = _collectable_tests(
-                    str(wt_path), repo, p2p_existing_tests, venv_python
+        if check_pass_to_pass:
+            if pass_to_pass_raw:
+                p2p_existing_tests = _existing_nodeids(
+                    wt_path, pass_to_pass_raw, repo
+                )[:max_pass_to_pass]
+                if p2p_existing_tests:
+                    p2p_existing_tests = _collectable_tests(
+                        str(wt_path), repo, p2p_existing_tests, venv_python
+                    )
+                    if max_pass_to_pass is not None:
+                        p2p_existing_tests = p2p_existing_tests[:max_pass_to_pass]
+
+            adjacent_p2p_tests: list[str] = []
+            if include_adjacent_pass_to_pass:
+                adjacent_p2p_tests = _adjacent_pass_to_pass_candidates(
+                    wt_path,
+                    repo,
+                    existing_tests,
+                    p2p_existing_tests,
+                    venv_python,
+                    max_tests=max_adjacent_pass_to_pass,
+                    timeout=test_timeout,
                 )
-                if max_pass_to_pass is not None:
-                    p2p_existing_tests = p2p_existing_tests[:max_pass_to_pass]
-                if clean_pass_to_pass and p2p_existing_tests:
+                if adjacent_p2p_tests:
                     print(
-                        "  [p2p-clean] Healthy filter: running "
-                        f"{len(p2p_existing_tests)} pass_to_pass tests individually..."
+                        "  [p2p-adjacent] Added "
+                        f"{len(adjacent_p2p_tests)} same-module/sibling tests"
                     )
-                    p2p_existing_tests, p2p_healthy_failed_tests = _filter_passing_tests(
-                        str(wt_path), repo, p2p_existing_tests,
-                        python=venv_python, timeout=test_timeout
-                    )
-                    print(
-                        f"        healthy-clean={len(p2p_existing_tests)} "
-                        f"healthy-failed={len(p2p_healthy_failed_tests)}"
-                    )
+                    p2p_existing_tests = list(dict.fromkeys([*p2p_existing_tests, *adjacent_p2p_tests]))
+
+            if clean_pass_to_pass and p2p_existing_tests:
+                print(
+                    "  [p2p-clean] Healthy filter: running "
+                    f"{len(p2p_existing_tests)} pass_to_pass tests individually..."
+                )
+                p2p_existing_tests, p2p_healthy_failed_tests = _filter_passing_tests(
+                    str(wt_path), repo, p2p_existing_tests,
+                    python=venv_python, timeout=test_timeout,
+                    metrics=test_metrics,
+                    phase="p2p_healthy_filter",
+                )
+                print(
+                    f"        healthy-clean={len(p2p_existing_tests)} "
+                    f"healthy-failed={len(p2p_healthy_failed_tests)}"
+                )
 
         # ── Step 1: Healthy check (target tests should PASS) ──
         print(f"  [1/3] Healthy check: running target tests on clean HEAD...")
         healthy_result = run_repo_tests(str(wt_path), repo, existing_tests,
                                         timeout=test_timeout, python=venv_python)
+        _record_test_metrics(test_metrics, "target_healthy", existing_tests, healthy_result)
         healthy_executed = int(healthy_result.get("total") or 0) > 0
+        target_execution_fallback = None
+        if not healthy_executed:
+            fallback_tests, fallback_result = _retry_with_target_execution_fallback(
+                str(wt_path),
+                repo,
+                existing_tests,
+                venv_python,
+                test_timeout,
+                metrics=test_metrics,
+                phase="target_healthy_execution_fallback",
+            )
+            if fallback_result:
+                target_execution_fallback = {
+                    "from": existing_tests,
+                    "to": fallback_tests,
+                    "result": fallback_result,
+                }
+                fallback_executed = int(fallback_result.get("total") or 0) > 0
+                if fallback_executed:
+                    existing_tests = fallback_tests
+                    healthy_result = fallback_result
+                    healthy_executed = True
         target_healthy_minimized_from_failure = False
         target_healthy_failed_tests: list[str] = []
         if healthy_result["returncode"] != 0 and healthy_executed and len(existing_tests) > 1:
@@ -1231,7 +1496,9 @@ def verify_instance(
             )
             passing, failing = _filter_passing_tests(
                 str(wt_path), repo, existing_tests,
-                python=venv_python, timeout=test_timeout
+                python=venv_python, timeout=test_timeout,
+                metrics=test_metrics,
+                phase="target_healthy_minimize",
             )
             target_healthy_failed_tests = failing
             if passing:
@@ -1240,6 +1507,7 @@ def verify_instance(
                     str(wt_path), repo, existing_tests,
                     timeout=test_timeout, python=venv_python
                 )
+                _record_test_metrics(test_metrics, "target_healthy_minimized", existing_tests, healthy_result)
                 healthy_executed = int(healthy_result.get("total") or 0) > 0
                 target_healthy_minimized_from_failure = True
         healthy_pass = healthy_result["returncode"] == 0 and healthy_executed
@@ -1258,7 +1526,9 @@ def verify_instance(
                 "target_test_count": len(existing_tests),
                 "target_healthy_minimized_from_failure": target_healthy_minimized_from_failure,
                 "target_healthy_failed_tests": target_healthy_failed_tests[:10],
+                "target_execution_fallback": target_execution_fallback,
                 "pass_to_fail": False,
+                "test_metrics": test_metrics,
             }
             return result
 
@@ -1268,7 +1538,7 @@ def verify_instance(
 
         if not diff_rel_path:
             print(f"  [FAIL] No injected_diff path in result")
-            result["verification"] = {"status": "diff_file_missing"}
+            result["verification"] = {"status": "diff_file_missing", "test_metrics": test_metrics}
             return result
 
         project_root = Path(__file__).resolve().parent.parent
@@ -1276,7 +1546,7 @@ def verify_instance(
 
         if not diff_path.exists():
             print(f"  [FAIL] Diff file not found: {diff_path}")
-            result["verification"] = {"status": "diff_file_missing"}
+            result["verification"] = {"status": "diff_file_missing", "test_metrics": test_metrics}
             return result
 
         proc = subprocess.run(
@@ -1286,7 +1556,7 @@ def verify_instance(
         )
         if proc.returncode != 0:
             print(f"  [FAIL] git apply failed: {proc.stderr.decode()[:200]}")
-            result["verification"] = {"status": "diff_apply_failed"}
+            result["verification"] = {"status": "diff_apply_failed", "test_metrics": test_metrics}
             return result
 
         diff_size = len(git_text("diff", cwd=str(wt_path)))
@@ -1296,6 +1566,7 @@ def verify_instance(
         print(f"  [3/3] P2F check: running target tests on buggy revision...")
         buggy_result = run_repo_tests(str(wt_path), repo, existing_tests,
                                       timeout=test_timeout, python=venv_python)
+        _record_test_metrics(test_metrics, "target_buggy", existing_tests, buggy_result)
         buggy_executed = int(buggy_result.get("total") or 0) > 0
         target_failed = buggy_result["returncode"] != 0 and buggy_executed
         print(f"        rc={buggy_result['returncode']} passed={buggy_result['passed']} "
@@ -1319,7 +1590,9 @@ def verify_instance(
                 if clean_pass_to_pass:
                     clean_p2p_tests, p2p_buggy_failed_tests = _filter_passing_tests(
                         str(wt_path), repo, p2p_existing_tests,
-                        python=venv_python, timeout=test_timeout
+                        python=venv_python, timeout=test_timeout,
+                        metrics=test_metrics,
+                        phase="p2p_buggy_filter",
                     )
                     p2p_buggy_result = {
                         "returncode": 0 if len(clean_p2p_tests) == len(p2p_existing_tests) else 1,
@@ -1338,6 +1611,7 @@ def verify_instance(
                         str(wt_path), repo, p2p_existing_tests,
                         timeout=test_timeout, python=venv_python
                     )
+                    _record_test_metrics(test_metrics, "p2p_buggy", p2p_existing_tests, p2p_buggy_result)
                     no_regression = p2p_buggy_result["returncode"] == 0
                     clean_p2p_tests = p2p_existing_tests if no_regression else []
                     print(f"        rc={p2p_buggy_result['returncode']} passed={p2p_buggy_result['passed']} "
@@ -1361,6 +1635,7 @@ def verify_instance(
                     str(wt_path), repo, existing_tests,
                     timeout=test_timeout, python=venv_python
                 )
+                _record_test_metrics(test_metrics, "target_repaired", existing_tests, repaired_result)
                 repaired_executed = int(repaired_result.get("total") or 0) > 0
                 golden_repair_pass = repaired_result["returncode"] == 0 and repaired_executed
                 print(f"        target rc={repaired_result['returncode']} "
@@ -1370,7 +1645,9 @@ def verify_instance(
                     if clean_pass_to_pass:
                         clean_p2p_tests, p2p_repaired_failed_tests = _filter_passing_tests(
                             str(wt_path), repo, clean_p2p_tests,
-                            python=venv_python, timeout=test_timeout
+                            python=venv_python, timeout=test_timeout,
+                            metrics=test_metrics,
+                            phase="p2p_repaired_filter",
                         )
                         p2p_repaired_result = {
                             "returncode": 0 if not p2p_repaired_failed_tests else 1,
@@ -1389,6 +1666,7 @@ def verify_instance(
                             str(wt_path), repo, clean_p2p_tests,
                             timeout=test_timeout, python=venv_python
                         )
+                        _record_test_metrics(test_metrics, "p2p_repaired", clean_p2p_tests, p2p_repaired_result)
                         p2p_repaired_pass = p2p_repaired_result["returncode"] == 0
                         print(f"        p2p rc={p2p_repaired_result['returncode']} "
                               f"passed={p2p_repaired_result['passed']} "
@@ -1433,6 +1711,8 @@ def verify_instance(
             "duration_seconds": round(duration, 2),
             "pass_to_pass_checked": bool(p2p_existing_tests),
             "pass_to_pass_test_count": len(p2p_existing_tests),
+            "adjacent_pass_to_pass_enabled": include_adjacent_pass_to_pass,
+            "max_adjacent_pass_to_pass": max_adjacent_pass_to_pass,
             "no_regression": no_regression,
             "clean_pass_to_pass": clean_p2p_tests,
             "clean_pass_to_pass_count": len(clean_p2p_tests),
@@ -1453,6 +1733,7 @@ def verify_instance(
             "p2p_repaired_passed": p2p_repaired_result["passed"] if p2p_repaired_result else 0,
             "p2p_repaired_failed": p2p_repaired_result["failed"] if p2p_repaired_result else 0,
             "p2p_repaired_failed_tests": p2p_repaired_failed_tests[:10],
+            "test_metrics": test_metrics,
         }
 
         p2f_ok = target_failed and healthy_pass
@@ -1495,6 +1776,10 @@ def main():
                         help="After P2F, reverse the injected diff and run target tests again")
     parser.add_argument("--max-target-tests", type=int, default=None,
                         help="Skip instances with more target nodeids than this")
+    parser.add_argument("--no-adjacent-pass-to-pass", action="store_true",
+                        help="Disable same-file/sibling-test P2P expansion")
+    parser.add_argument("--max-adjacent-pass-to-pass", type=int, default=25,
+                        help="Maximum adjacent P2P nodeids to add per instance")
     parser.add_argument("--force", action="store_true",
                         help="Re-run instances even if an output verification row already exists")
     args = parser.parse_args()
@@ -1561,6 +1846,8 @@ def main():
                 max_target_tests=args.max_target_tests,
                 clean_pass_to_pass=args.clean_pass_to_pass,
                 require_clean_pass_to_pass=args.require_clean_pass_to_pass,
+                include_adjacent_pass_to_pass=not args.no_adjacent_pass_to_pass,
+                max_adjacent_pass_to_pass=args.max_adjacent_pass_to_pass,
             )
         except Exception as e:
             print(f"  [ERROR] {e}")

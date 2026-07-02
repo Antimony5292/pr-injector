@@ -93,6 +93,14 @@ def construction_metrics(final_dir: Path) -> dict[str, Any]:
     diff_file_counts = Counter()
     source_patch_file_counts = Counter()
     verification_seconds_by_level: dict[str, list[float]] = defaultdict(list)
+    injection_stage_seconds_by_level: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    injection_stage_attempts_by_level: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    injection_retry_count_by_level: dict[str, list[float]] = defaultdict(list)
+    verification_test_commands_by_level: dict[str, list[float]] = defaultdict(list)
+    verification_test_nodeids_by_level: dict[str, list[float]] = defaultdict(list)
+    verification_test_commands_by_phase: dict[str, list[float]] = defaultdict(list)
+    verification_test_nodeids_by_phase: dict[str, list[float]] = defaultdict(list)
+    verification_test_seconds_by_phase: dict[str, list[float]] = defaultdict(list)
     l3_prompt_tokens = 0
     l3_completion_tokens = 0
     l3_attempts: list[float] = []
@@ -113,6 +121,38 @@ def construction_metrics(final_dir: Path) -> dict[str, Any]:
         duration = field_number(verification, ["duration_seconds", "elapsed_seconds", "runtime_seconds"])
         if duration is not None:
             verification_seconds_by_level[level].append(duration)
+
+        injection_metrics = row.get("injection_metrics") or {}
+        for stage, value in (injection_metrics.get("level_runtime_seconds") or {}).items():
+            if isinstance(value, (int, float)):
+                injection_stage_seconds_by_level[level][str(stage)].append(float(value))
+        for stage, value in (injection_metrics.get("level_attempts") or {}).items():
+            if isinstance(value, (int, float)):
+                injection_stage_attempts_by_level[level][str(stage)].append(float(value))
+        retry_total = 0.0
+        for stage, value in (injection_metrics.get("level_retry_count") or {}).items():
+            if isinstance(value, (int, float)):
+                retry_total += float(value)
+                injection_stage_attempts_by_level[level][f"{stage}_retries"].append(float(value))
+        if retry_total:
+            injection_retry_count_by_level[level].append(retry_total)
+
+        test_metrics = verification.get("test_metrics") or {}
+        exact_commands = field_number(test_metrics, ["test_command_count"])
+        exact_nodeids = field_number(test_metrics, ["test_nodeid_count"])
+        if exact_commands is not None:
+            verification_test_commands_by_level[level].append(exact_commands)
+        if exact_nodeids is not None:
+            verification_test_nodeids_by_level[level].append(exact_nodeids)
+        for phase, value in (test_metrics.get("test_command_count_by_phase") or {}).items():
+            if isinstance(value, (int, float)):
+                verification_test_commands_by_phase[str(phase)].append(float(value))
+        for phase, value in (test_metrics.get("test_nodeid_count_by_phase") or {}).items():
+            if isinstance(value, (int, float)):
+                verification_test_nodeids_by_phase[str(phase)].append(float(value))
+        for phase, value in (test_metrics.get("test_command_duration_seconds_by_phase") or {}).items():
+            if isinstance(value, (int, float)):
+                verification_test_seconds_by_phase[str(phase)].append(float(value))
 
         raw_p2p = field_number(verification, ["pass_to_pass_test_count"])
         clean_p2p = field_number(verification, ["clean_pass_to_pass_count"])
@@ -143,15 +183,24 @@ def construction_metrics(final_dir: Path) -> dict[str, Any]:
         estimated_test_runs_by_level[level].append(float(estimated_runs))
 
         l3 = row.get("l3_metadata") or {}
-        l3_prompt_tokens += int(l3.get("prompt_tokens") or 0)
-        l3_completion_tokens += int(l3.get("completion_tokens") or 0)
-        attempt = field_number(l3, ["attempt", "attempts", "retry_count"])
+        metric_prompt_tokens = int(injection_metrics.get("l3_prompt_tokens") or 0)
+        metric_completion_tokens = int(injection_metrics.get("l3_completion_tokens") or 0)
+        l3_prompt_tokens += metric_prompt_tokens or int(l3.get("prompt_tokens") or 0)
+        l3_completion_tokens += metric_completion_tokens or int(l3.get("completion_tokens") or 0)
+        attempt = None
+        level_attempts = injection_metrics.get("level_attempts") or {}
+        if isinstance(level_attempts.get("L3"), (int, float)):
+            attempt = float(level_attempts["L3"])
+        if attempt is None:
+            attempt = field_number(l3, ["attempt", "attempts", "retry_count"])
         if attempt is not None:
             l3_attempts.append(attempt)
         confidence = field_number(l3, ["confidence"])
         if confidence is not None:
             l3_confidence.append(confidence)
-        cost = field_number(l3, ["cost_usd", "total_cost_usd"])
+        cost = field_number(injection_metrics, ["l3_cost_usd"])
+        if cost is None:
+            cost = field_number(l3, ["cost_usd", "total_cost_usd"])
         if cost is not None:
             l3_costs.append(cost)
 
@@ -165,6 +214,32 @@ def construction_metrics(final_dir: Path) -> dict[str, Any]:
         "source_patch_file_count_histogram": dict(sorted(source_patch_file_counts.items())),
         "verification_duration_seconds_by_level": {
             level: summarize_numbers(values) for level, values in sorted(verification_seconds_by_level.items())
+        },
+        "injection_stage_duration_seconds_by_level": {
+            level: {stage: summarize_numbers(values) for stage, values in sorted(stages.items())}
+            for level, stages in sorted(injection_stage_seconds_by_level.items())
+        },
+        "injection_stage_attempts_by_level": {
+            level: {stage: summarize_numbers(values) for stage, values in sorted(stages.items())}
+            for level, stages in sorted(injection_stage_attempts_by_level.items())
+        },
+        "injection_retry_count_by_level": {
+            level: summarize_numbers(values) for level, values in sorted(injection_retry_count_by_level.items())
+        },
+        "verification_test_command_count_by_level": {
+            level: summarize_numbers(values) for level, values in sorted(verification_test_commands_by_level.items())
+        },
+        "verification_test_nodeid_count_by_level": {
+            level: summarize_numbers(values) for level, values in sorted(verification_test_nodeids_by_level.items())
+        },
+        "verification_test_command_count_by_phase": {
+            phase: summarize_numbers(values) for phase, values in sorted(verification_test_commands_by_phase.items())
+        },
+        "verification_test_nodeid_count_by_phase": {
+            phase: summarize_numbers(values) for phase, values in sorted(verification_test_nodeids_by_phase.items())
+        },
+        "verification_test_duration_seconds_by_phase": {
+            phase: summarize_numbers(values) for phase, values in sorted(verification_test_seconds_by_phase.items())
         },
         "estimated_test_run_count_by_level": {
             level: summarize_numbers(values) for level, values in sorted(estimated_test_runs_by_level.items())

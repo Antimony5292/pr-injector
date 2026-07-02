@@ -85,6 +85,31 @@ def classify(row: dict) -> tuple[str, str]:
     if any(p in tail for p in env_patterns):
         return "workflow_env_or_dependency_issue", "local evaluator environment/dependency incompatibility"
 
+    harness_noise_patterns = [
+        "ERROR collecting",
+        "ERROR: file or directory not found",
+        "not found:",
+        "no tests ran",
+        "no match in any of",
+        "ImportError while importing test module",
+        "ModuleNotFoundError:",
+        "No such file or directory",
+        "is not a valid Python module",
+        "requires pytest",
+        "minversion",
+        "unknown config option",
+        "unrecognized arguments:",
+        "does not refer to a test",
+        "Could not find test",
+        "Failed to import test module",
+    ]
+    if any(p in tail for p in harness_noise_patterns):
+        if ftp.get("returncode") not in (None, 0):
+            return "workflow_fail_to_pass_harness_noise", "FAIL_TO_PASS evaluation hit nodeid/env/test collection noise"
+        if p2p.get("returncode") not in (None, 0):
+            return "workflow_pass_to_pass_harness_noise", "PASS_TO_PASS evaluation hit nodeid/env/test collection noise"
+        return "workflow_harness_noise", "evaluation harness emitted nodeid/env/test collection noise"
+
     if (p2p.get("returncode") not in (None, 0)) and (
         "not found:" in tail or "no match in any of" in tail or "no tests ran" in tail
     ):

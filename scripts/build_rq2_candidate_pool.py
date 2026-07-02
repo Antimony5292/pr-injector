@@ -168,7 +168,7 @@ def write_jsonl(path: Path, records: list[dict]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="experiments/rq2_100")
-    parser.add_argument("--pro-seed", default="experiments/swebench_pro/sampled_35.jsonl")
+    parser.add_argument("--pro-seed", default="/Users/harmin/Desktop/sampled_35.jsonl")
     parser.add_argument("--pro-limit", type=int, default=120)
     parser.add_argument("--verified-limit", type=int, default=180)
     args = parser.parse_args()

@@ -39,6 +39,18 @@ from pr_injector.ast_engine.hunk_surgeon import (
     reverse_patch_hunks_for_file,
 )
 from pr_injector.core.compatibility import check_source_compatibility, reports_to_dicts
+try:
+    from prinjector_v2_metrics import (
+        FidelityGateConfig,
+        build_fidelity_feedback_prompt,
+        evaluate_patch_pair_fidelity,
+    )
+except ModuleNotFoundError:
+    from scripts.prinjector_v2_metrics import (
+        FidelityGateConfig,
+        build_fidelity_feedback_prompt,
+        evaluate_patch_pair_fidelity,
+    )
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8")
@@ -205,6 +217,28 @@ def coerce_list(value) -> list[str]:
     return []
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.lower() in {"1", "true", "yes", "on"}
+
+
+def _truncate_for_l3_context(content: str, limit: int) -> str:
+    """Keep both file ends when a large current file must be shortened."""
+
+    if limit <= 0 or len(content) <= limit:
+        return content
+    head = max(1000, limit // 2)
+    tail = max(1000, limit - head)
+    omitted = len(content) - head - tail
+    return (
+        content[:head]
+        + f"\n... (truncated {omitted} characters from the middle; tail follows)\n"
+        + content[-tail:]
+    )
+
+
 def reverse_patch(patch: str) -> str:
     """Reverse a unified diff."""
     lines = patch.split("\n")
@@ -318,6 +352,7 @@ def run_target_preflight(
             _existing_nodeids,
             _install_project,
             _read_requires_python,
+            _retry_with_target_execution_fallback,
             _test_runner_available,
             run_repo_tests,
         )
@@ -329,8 +364,7 @@ def run_target_preflight(
         }
 
     existing_tests = _existing_nodeids(wt_path, target_tests, repo)
-    if not existing_tests:
-        return {"ok": False, "reason": "test_files_missing"}
+    tests_for_collect = existing_tests or target_tests
 
     print("  [preflight] Installing deps and checking target tests on healthy HEAD...")
     venv_python = _create_venv(str(wt_path), repo)
@@ -340,12 +374,24 @@ def run_target_preflight(
             "reason": "python_version_unavailable",
             "requires_python": _read_requires_python(wt_path),
         }
-    _install_project(str(wt_path), repo, timeout, python=venv_python, test_files=existing_tests)
+    _install_project(str(wt_path), repo, timeout, python=venv_python, test_files=tests_for_collect)
     if not _test_runner_available(str(wt_path), repo, venv_python):
         return {"ok": False, "reason": "test_runner_unavailable"}
-    collectable = _collectable_tests(str(wt_path), repo, existing_tests, venv_python)
+    collectable = _collectable_tests(str(wt_path), repo, tests_for_collect, venv_python)
     if not collectable:
-        return {"ok": False, "reason": "target_nodeids_not_collectable"}
+        return {
+            "ok": False,
+            "reason": "target_nodeids_not_collectable"
+            if existing_tests
+            else "target_nodeids_not_remappable",
+            "raw_target_tests": target_tests,
+            "existing_target_tests": existing_tests,
+        }
+    if not existing_tests:
+        print(
+            "  [preflight] Target nodeids remapped: "
+            f"{len(target_tests)} raw → {len(collectable)} collectable"
+        )
     original_collectable_count = len(collectable)
     minimized = False
     if max_target_tests is not None and len(collectable) > max_target_tests:
@@ -379,6 +425,28 @@ def run_target_preflight(
         str(wt_path), repo, collectable, timeout=timeout, python=venv_python
     )
     healthy_executed = int(healthy_result.get("total") or 0) > 0
+    target_execution_fallback = None
+    if not healthy_executed:
+        fallback_tests, fallback_result = _retry_with_target_execution_fallback(
+            str(wt_path),
+            repo,
+            collectable,
+            venv_python,
+            timeout,
+            metrics=None,
+            phase="preflight_target_execution_fallback",
+        )
+        if fallback_result:
+            target_execution_fallback = {
+                "from": collectable,
+                "to": fallback_tests,
+                "result": fallback_result,
+            }
+            fallback_executed = int(fallback_result.get("total") or 0) > 0
+            if fallback_executed:
+                collectable = fallback_tests
+                healthy_result = fallback_result
+                healthy_executed = True
     healthy_minimized_from_failure = False
     healthy_failed_tests: list[str] = []
     if healthy_result["returncode"] != 0 and healthy_executed and len(collectable) > 1:
@@ -404,6 +472,7 @@ def run_target_preflight(
             "collectable_target_tests": collectable,
             "healthy_result": healthy_result,
             "healthy_failed_tests": healthy_failed_tests,
+            "target_execution_fallback": target_execution_fallback,
         }
     return {
         "ok": True,
@@ -413,6 +482,7 @@ def run_target_preflight(
         "minimized": minimized,
         "healthy_minimized_from_failure": healthy_minimized_from_failure,
         "healthy_failed_tests": healthy_failed_tests,
+        "target_execution_fallback": target_execution_fallback,
         "minimize_candidate_limit": (
             int(os.environ.get(
                 "PRI_PREFLIGHT_TARGET_MINIMIZE_CANDIDATES",
@@ -558,6 +628,9 @@ def try_level2(
                 "compatibility_rejected_files": rejected_files,
                 "hunk_replacements": hunk_replacements,
                 "function_replacements": function_replacements,
+                "hunk_replacement_count": len(hunk_replacements),
+                "function_replacement_count": len(function_replacements),
+                "level2_simplification_risk": bool(function_replacements and not hunk_replacements),
                 "skipped_whole_function_replacements": skipped_whole_function_replacements,
                 "whole_function_level2_enabled": allow_whole_function,
                 "level2_mode": level2_mode,
@@ -574,6 +647,9 @@ def try_level2(
                 "compatibility_rejected_files": rejected_files,
                 "hunk_replacements": hunk_replacements,
                 "function_replacements": function_replacements,
+                "hunk_replacement_count": len(hunk_replacements),
+                "function_replacement_count": len(function_replacements),
+                "level2_simplification_risk": bool(function_replacements and not hunk_replacements),
                 "skipped_whole_function_replacements": skipped_whole_function_replacements,
                 "whole_function_level2_enabled": allow_whole_function,
                 "level2_mode": level2_mode,
@@ -587,6 +663,9 @@ def try_level2(
         "compatibility_rejected_files": rejected_files,
         "hunk_replacements": hunk_replacements,
         "function_replacements": function_replacements,
+        "hunk_replacement_count": len(hunk_replacements),
+        "function_replacement_count": len(function_replacements),
+        "level2_simplification_risk": bool(function_replacements and not hunk_replacements),
         "skipped_whole_function_replacements": skipped_whole_function_replacements,
         "whole_function_level2_enabled": allow_whole_function,
         "level2_mode": level2_mode,
@@ -656,12 +735,66 @@ def _extract_function_sources(source: str, tree) -> dict[str, FunctionSource]:
 
 # ── Level 3: LLM Semantic Injection ──────────────────────────────────────────
 
+def _target_test_context_for_l3(worktree: str, target_tests: list[str]) -> str:
+    """Return compact target-test source context for semantic injection.
+
+    P2F misses are often caused by a generated diff that is syntactically
+    plausible but does not affect the current target test path. Supplying the
+    target test source gives Level 3 enough behavioral signal while still
+    keeping edits restricted to source files shown in the Current Codebase
+    section.
+    """
+
+    if not target_tests:
+        return "(No target tests provided.)"
+
+    max_files = int(os.environ.get("PRI_L3_TARGET_TEST_CONTEXT_MAX_FILES", "4"))
+    limit = int(os.environ.get("PRI_L3_TARGET_TEST_CONTEXT_LIMIT", "12000"))
+    paths: list[str] = []
+    for test in target_tests:
+        path = ""
+        if "::" in test:
+            path = test.split("::", 1)[0]
+        elif "." in test and "/" not in test:
+            parts = test.split(".")
+            if len(parts) >= 3:
+                path = "tests/" + "/".join(parts[:-2]) + ".py"
+        if path and path.endswith(".py") and path not in paths:
+            paths.append(path)
+        if len(paths) >= max_files:
+            break
+
+    sections = [
+        "Target tests:",
+        *[f"- {test}" for test in target_tests[: int(os.environ.get("PRI_L3_TARGET_TEST_LIST_LIMIT", "12"))]],
+    ]
+    for rel in paths:
+        path = Path(worktree) / rel
+        if not path.exists():
+            continue
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        content = _truncate_for_l3_context(content, limit)
+        sections.append(f"\n### {rel}\n```python\n{content}\n```")
+
+    return "\n".join(sections)
+
 def try_level3(
     worktree: str,
     repo_dir: str,
     base_commit: str,
     patch: str,
     problem_statement: str,
+    target_tests: list[str] | None = None,
+    fidelity_gate: bool = False,
+    fidelity_gate_config: FidelityGateConfig | None = None,
+    a_fail_to_pass: list[str] | None = None,
+    b_fail_to_pass: list[str] | None = None,
+    a_pass_to_pass: list[str] | None = None,
+    b_pass_to_pass: list[str] | None = None,
+    retry_feedback_seed: str = "",
 ) -> tuple[bool, str, dict]:
     """Attempt Level 3: LLM semantic reversion.
 
@@ -698,8 +831,10 @@ def try_level3(
         target_path = Path(worktree) / current_filepath
         if target_path.exists():
             content = target_path.read_text(encoding="utf-8", errors="replace")
-            if len(content) > 15000:
-                content = content[:15000] + "\n... (truncated)"
+            content = _truncate_for_l3_context(
+                content,
+                int(os.environ.get("PRI_L3_FILE_CONTEXT_LIMIT", "30000")),
+            )
             current_files[current_filepath] = content
 
     # If no source files exist on HEAD, check if the logic migrated elsewhere
@@ -713,8 +848,10 @@ def try_level3(
                     for py_file in wt_parent.rglob("*.py"):
                         rel = str(py_file.relative_to(worktree)).replace("\\", "/")
                         content = py_file.read_text(encoding="utf-8", errors="replace")
-                        if len(content) > 10000:
-                            content = content[:10000] + "\n... (truncated)"
+                        content = _truncate_for_l3_context(
+                            content,
+                            int(os.environ.get("PRI_L3_DISCOVERY_FILE_CONTEXT_LIMIT", "20000")),
+                        )
                         current_files[rel] = content
                         if len(current_files) >= 5:
                             break
@@ -728,6 +865,8 @@ def try_level3(
     files_section = ""
     for path, content in current_files.items():
         files_section += f"### {path}\n```python\n{content}\n```\n\n"
+    target_tests = target_tests or []
+    target_section = _target_test_context_for_l3(worktree, target_tests)
 
     system_prompt = (
         "You are an expert software engineer tasked with recreating a historical bug in a modern"
@@ -739,7 +878,14 @@ def try_level3(
         " any new imports or dependencies.\n6. Preserve all existing functionality EXCEPT for the"
         " specific bug being reintroduced.\n7. Start your response with 'diff --git'.\n"
         "8. Modify ONLY files shown in the Current Codebase section. Do not create diffs for"
-        " historical files that are absent from the current codebase."
+        " historical files that are absent from the current codebase.\n"
+        "9. Preserve the original fix's difficulty surface: if the original fix spans multiple"
+        " files, hunks, branches, API contracts, or modules, the injected bug must preserve the"
+        " equivalent cross-file or cross-module relationship in the modern code. Do not collapse"
+        " a multi-hunk or multi-module historical bug into a tiny one-line local bug merely because"
+        " that would trigger a target test.\n"
+        "10. Every response line must be a legal unified-diff line. Never include analysis,"
+        " caveats, prose, bullets, or sentences inside or after the diff."
     )
 
     user_prompt = f"""## Original Bug Context
@@ -749,12 +895,16 @@ def try_level3(
 
 ### Original Fix (PR Diff)
 ```diff
-{patch[:8000]}
+{patch[:int(os.environ.get("PRI_L3_PATCH_CONTEXT_LIMIT", "16000"))]}
 ```
 
 ## Current Codebase (Latest Version)
 
 {files_section}
+
+## Target Test Context
+
+{target_section}
 
 Allowed current files: {", ".join(current_files.keys())}
 
@@ -765,7 +915,10 @@ Your task: Create a unified diff that reintroduces the SAME logical bug into the
 
 The bug should:
 - Cause the same category of failure as the original
+- Specifically affect the behavior exercised by the target tests above
 - Be in the equivalent code location (which may have moved or been refactored)
+- Preserve the original fix's approximate scope: files, hunks, functions, and API contract surface
+- Avoid over-localizing the failure into a single trivial statement when the original fix was broader
 - Be subtle enough that it's not immediately obvious
 
 Output ONLY the unified diff, starting with "diff --git"."""
@@ -784,17 +937,20 @@ Output ONLY the unified diff, starting with "diff --git"."""
     print(f"       Current files available: {list(current_files.keys())}")
 
     max_attempts = max(1, int(os.environ.get("PRI_L3_APPLY_ATTEMPTS", "2")))
-    retry_feedback = ""
+    retry_feedback = retry_feedback_seed
     last_error = "Level 3: no attempt made"
     last_meta: dict = {}
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_cost_usd = 0.0
     for attempt in range(1, max_attempts + 1):
         attempt_user_prompt = user_prompt
         if retry_feedback:
             attempt_user_prompt += f"""
 
-## Previous diff failed to apply
+## Feedback From Previous Attempt
 
-The previous unified diff was rejected by `git apply --check --recount`:
+The previous attempt did not pass construction validation:
 
 ```text
 {retry_feedback[:2000]}
@@ -802,7 +958,10 @@ The previous unified diff was rejected by `git apply --check --recount`:
 
 Regenerate the diff from the CURRENT code shown above. Keep modern function
 signatures and modern imports. Do not use stale line numbers or historical
-files. Output ONLY a clean unified diff.
+files. Match the original patch's approximate files, hunks, line-change surface,
+and target-test semantics. Output ONLY a clean unified diff. If the previous
+error mentioned a corrupt patch or unexpected line, remove all prose and ensure
+every hunk body line starts with exactly one of: space, +, -, or \\.
 """
         try:
             if provider == "azure":
@@ -818,6 +977,15 @@ files. Output ONLY a clean unified diff.
                     litellm_model, system_prompt, attempt_user_prompt
                 )
             meta["attempt"] = attempt
+            meta["max_attempts"] = max_attempts
+            meta["retry_count"] = max(0, attempt - 1)
+            total_prompt_tokens += int(meta.get("prompt_tokens") or 0)
+            total_completion_tokens += int(meta.get("completion_tokens") or 0)
+            total_cost_usd += float(meta.get("cost_usd") or meta.get("total_cost_usd") or 0.0)
+            meta["total_prompt_tokens"] = total_prompt_tokens
+            meta["total_completion_tokens"] = total_completion_tokens
+            meta["total_tokens"] = total_prompt_tokens + total_completion_tokens
+            meta["total_cost_usd"] = round(total_cost_usd, 8)
             last_meta = meta
 
             print(
@@ -891,6 +1059,57 @@ files. Output ONLY a clean unified diff.
             applied_diff = git_text("diff", cwd=worktree)
             if applied_diff.strip():
                 meta["confidence"] = _estimate_confidence(applied_diff, patch)
+                meta["fidelity"] = _l3_fidelity_profile(applied_diff, patch)
+                if fidelity_gate:
+                    v2_gate = evaluate_patch_pair_fidelity(
+                        a_patch=patch,
+                        b_patch=applied_diff,
+                        a_fail_to_pass=a_fail_to_pass,
+                        b_fail_to_pass=b_fail_to_pass or target_tests,
+                        a_pass_to_pass=a_pass_to_pass,
+                        b_pass_to_pass=b_pass_to_pass,
+                        injection_level="Level_3_LLM_Semantic",
+                        config=fidelity_gate_config,
+                    )
+                    v2_gate["stage"] = "l3_generation"
+                    meta["v2_fidelity_gate"] = v2_gate
+                    meta["v2_fidelity_feedback_prompt"] = build_fidelity_feedback_prompt(v2_gate)
+                    if (
+                        not v2_gate.get("pass_gate")
+                        and env_bool("PRI_L3_REJECT_V2_GATE", True)
+                    ):
+                        subprocess.run(
+                            ["git", "apply", "-R"],
+                            cwd=worktree,
+                            input=applied_diff.encode(),
+                            capture_output=True,
+                            timeout=30,
+                        )
+                        last_error = "Level 3: generated diff failed v2 fidelity gate"
+                        retry_feedback = meta["v2_fidelity_feedback_prompt"]
+                        print(
+                            "       Rejected v2-gate-failing Level 3 diff; "
+                            f"score={v2_gate.get('score')} tags={v2_gate.get('tags')}"
+                        )
+                        continue
+                elif (
+                    env_bool("PRI_L3_REJECT_OVERSIMPLIFIED", True)
+                    and _complexity_mismatch(meta["fidelity"])
+                ):
+                    subprocess.run(
+                        ["git", "apply", "-R"],
+                        cwd=worktree,
+                        input=applied_diff.encode(),
+                        capture_output=True,
+                        timeout=30,
+                    )
+                    last_error = "Level 3: generated diff complexity does not match original patch"
+                    retry_feedback = (
+                        f"{last_error}. Fidelity profile: "
+                        f"{json.dumps(meta['fidelity'], ensure_ascii=False)[:1200]}"
+                    )
+                    print("       Rejected complexity-mismatched Level 3 diff; retrying")
+                    continue
                 return True, applied_diff, meta
 
             last_error = "Level 3: patch applied but produced no diff"
@@ -898,10 +1117,25 @@ files. Output ONLY a clean unified diff.
 
         except Exception as e:
             last_error = f"Level 3: LLM call failed: {str(e)[:200]}"
-            last_meta = {"error": str(e)[:300], "attempt": attempt}
+            last_meta = {
+                "error": str(e)[:300],
+                "attempt": attempt,
+                "max_attempts": max_attempts,
+                "retry_count": max(0, attempt - 1),
+                "total_prompt_tokens": total_prompt_tokens,
+                "total_completion_tokens": total_completion_tokens,
+                "total_tokens": total_prompt_tokens + total_completion_tokens,
+                "total_cost_usd": round(total_cost_usd, 8),
+            }
             retry_feedback = last_error
             continue
 
+    last_meta.setdefault("max_attempts", max_attempts)
+    last_meta.setdefault("retry_count", max(0, int(last_meta.get("attempt") or max_attempts) - 1))
+    last_meta.setdefault("total_prompt_tokens", total_prompt_tokens)
+    last_meta.setdefault("total_completion_tokens", total_completion_tokens)
+    last_meta.setdefault("total_tokens", total_prompt_tokens + total_completion_tokens)
+    last_meta.setdefault("total_cost_usd", round(total_cost_usd, 8))
     return False, last_error, last_meta
 
 
@@ -909,15 +1143,17 @@ def _extract_diff(response: str) -> str | None:
     """Extract unified diff from LLM response."""
     # Prefer fenced code blocks so trailing explanations are not swallowed by a
     # greedy bare-diff regex.
-    m = re.search(r"```(?:diff)?\s*\n(.*?)```", response, re.DOTALL)
-    if m:
+    for m in re.finditer(r"```(?:diff)?\s*\n(.*?)```", response, re.DOTALL):
         block = m.group(1).strip()
         if "diff --git" in block or "@@" in block:
-            return block
+            trimmed = _trim_bare_diff(block)
+            if trimmed:
+                return trimmed
     # Try bare diff as a fallback.
     m = re.search(r"(diff --git\s+.*)", response, re.DOTALL)
     if m:
-        return _trim_bare_diff(m.group(1).strip())
+        trimmed = _trim_bare_diff(m.group(1).strip())
+        return trimmed or None
     return None
 
 
@@ -935,20 +1171,44 @@ def _write_l3_debug(worktree: str, meta: dict, response: str, diff: str) -> None
 
 def _trim_bare_diff(diff: str) -> str:
     lines = diff.splitlines()
+    start = next((i for i, line in enumerate(lines) if line.startswith("diff --git ")), None)
+    if start is None:
+        return ""
+
     keep: list[str] = []
-    in_diff = False
-    for line in lines:
+    in_hunk = False
+    for line in lines[start:]:
         if line.startswith("diff --git "):
-            in_diff = True
+            in_hunk = False
             keep.append(line)
-        elif in_diff and (
-            line.startswith(("index ", "--- ", "+++ ", "@@ ", "+", "-", " "))
-            or line.startswith(("new file mode", "deleted file mode"))
+        elif line.startswith(
+            (
+                "index ",
+                "--- ",
+                "+++ ",
+                "new file mode",
+                "deleted file mode",
+                "old mode",
+                "new mode",
+                "similarity index ",
+                "rename from ",
+                "rename to ",
+            )
+        ):
+            in_hunk = False
+            keep.append(line)
+        elif line.startswith("@@ "):
+            in_hunk = True
+            keep.append(line)
+        elif in_hunk and (
+            line.startswith(("+", "-", " ", "\\ No newline at end of file"))
+            or line == ""
         ):
             keep.append(line)
-        elif in_diff and line.strip() == "":
-            keep.append(line)
-        elif in_diff:
+        elif line.strip() == "":
+            if keep:
+                keep.append(line)
+        else:
             break
     return "\n".join(keep).strip()
 
@@ -1149,6 +1409,102 @@ def _call_bedrock_l3(
     return content, meta
 
 
+def _diff_shape_for_l3(diff: str) -> dict:
+    files = sorted(_diff_files(diff))
+    source_files = [path for path in files if not is_test_file(path)]
+    added = sum(1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---"))
+    return {
+        "files": len(files),
+        "source_files": len(set(source_files)),
+        "modules": len(set(str(Path(path).parent) for path in source_files)),
+        "hunks": sum(1 for line in diff.splitlines() if line.startswith("@@ ")),
+        "line_changes": added + removed,
+        "added": added,
+        "removed": removed,
+    }
+
+
+def _l3_fidelity_profile(generated: str, original: str) -> dict:
+    generated_shape = _diff_shape_for_l3(generated)
+    original_shape = _diff_shape_for_l3(original)
+    original_lines = max(int(original_shape["line_changes"] or 0), 1)
+    original_hunks = max(int(original_shape["hunks"] or 0), 1)
+    original_source_files = max(int(original_shape["source_files"] or 0), 1)
+    line_ratio = generated_shape["line_changes"] / original_lines
+    hunk_ratio = generated_shape["hunks"] / original_hunks
+    source_file_ratio = generated_shape["source_files"] / original_source_files
+    simplification_reasons: list[str] = []
+    over_complexity_reasons: list[str] = []
+    if original_shape["source_files"] >= 2 and generated_shape["source_files"] <= 1:
+        simplification_reasons.append("source_file_count_collapsed")
+    if original_shape["modules"] >= 2 and generated_shape["modules"] <= 1:
+        simplification_reasons.append("module_count_collapsed")
+    if original_shape["hunks"] >= 3 and hunk_ratio < float(os.environ.get("PRI_L3_MIN_HUNK_RATIO", "0.35")):
+        simplification_reasons.append("hunk_count_collapsed")
+    if original_shape["line_changes"] >= 20 and line_ratio < float(os.environ.get("PRI_L3_MIN_LINE_RATIO", "0.20")):
+        simplification_reasons.append("line_change_count_collapsed")
+    if generated_shape["line_changes"] <= int(os.environ.get("PRI_L3_MIN_LINE_CHANGES", "4")) and original_shape["line_changes"] >= 12:
+        simplification_reasons.append("generated_diff_too_small")
+    if (
+        generated_shape["source_files"] - original_shape["source_files"] >= 2
+        and source_file_ratio > float(os.environ.get("PRI_L3_MAX_SOURCE_FILE_RATIO", "2.0"))
+    ):
+        over_complexity_reasons.append("source_file_count_inflated")
+    if (
+        generated_shape["hunks"] - original_shape["hunks"] >= 2
+        and hunk_ratio > float(os.environ.get("PRI_L3_MAX_HUNK_RATIO", "3.0"))
+    ):
+        over_complexity_reasons.append("hunk_count_inflated")
+    if (
+        generated_shape["line_changes"] - original_shape["line_changes"] >= 20
+        and line_ratio > float(os.environ.get("PRI_L3_MAX_LINE_RATIO", "4.0"))
+    ):
+        over_complexity_reasons.append("line_change_count_inflated")
+    fidelity_reasons = simplification_reasons + over_complexity_reasons
+    return {
+        "original": original_shape,
+        "generated": generated_shape,
+        "line_change_ratio": round(line_ratio, 4),
+        "hunk_ratio": round(hunk_ratio, 4),
+        "source_file_ratio": round(source_file_ratio, 4),
+        "simplification_risk": bool(simplification_reasons),
+        "simplification_reasons": simplification_reasons,
+        "over_complexity_risk": bool(over_complexity_reasons),
+        "over_complexity_reasons": over_complexity_reasons,
+        "fidelity_risk": bool(fidelity_reasons),
+        "fidelity_reasons": fidelity_reasons,
+    }
+
+
+def _complexity_mismatch(profile: dict) -> bool:
+    reasons = set(profile.get("fidelity_reasons") or [])
+    if not reasons:
+        return False
+    # Modern code often consolidates historical multi-file fixes into one
+    # module. Do not reject those solely because the file/module count collapsed
+    # when the generated diff still preserves a comparable hunk/line surface;
+    # strict P2F/P2P/golden repair verification remains the final gate.
+    collapse_only = reasons <= {"source_file_count_collapsed", "module_count_collapsed"}
+    if collapse_only:
+        min_hunk = float(os.environ.get("PRI_L3_COLLAPSE_ONLY_MIN_HUNK_RATIO", "0.50"))
+        min_line = float(os.environ.get("PRI_L3_COLLAPSE_ONLY_MIN_LINE_RATIO", "0.35"))
+        generated = profile.get("generated") or {}
+        if (
+            float(profile.get("hunk_ratio") or 0.0) >= min_hunk
+            and float(profile.get("line_change_ratio") or 0.0) >= min_line
+            and int(generated.get("line_changes") or 0) >= int(os.environ.get("PRI_L3_COLLAPSE_ONLY_MIN_LINES", "8"))
+        ):
+            profile["fidelity_relaxed"] = True
+            profile["fidelity_relaxation_reason"] = "collapsed_file_or_module_count_but_preserved_patch_surface"
+            return False
+    return bool(
+        profile.get("fidelity_risk")
+        or profile.get("simplification_risk")
+        or profile.get("over_complexity_risk")
+    )
+
+
 def _estimate_confidence(generated: str, original: str) -> float:
     """Quick confidence score."""
     gen_files = set(re.findall(r"diff --git a/(\S+)", generated))
@@ -1175,6 +1531,9 @@ def inject_instance(
     enable_l3: bool = False,
     preflight_target_tests: bool = False,
     max_target_tests: int | None = None,
+    v2_fidelity_gate: bool = False,
+    v2_require_fidelity_gate: bool = False,
+    v2_gate_config: FidelityGateConfig | None = None,
 ) -> dict:
     """Attempt injection for a single SWE-bench Pro instance."""
 
@@ -1190,6 +1549,10 @@ def inject_instance(
     if not target_tests:
         target_tests = extract_test_files_from_patch(test_patch)
     target_tests_to_run = fail_to_pass or target_tests
+    pass_to_pass = coerce_list(instance.get("pass_to_pass", []))
+    if v2_require_fidelity_gate:
+        v2_fidelity_gate = True
+    v2_gate_config = v2_gate_config or FidelityGateConfig()
 
     short_id = iid[:60]
     print(f"\n{'━' * 70}")
@@ -1201,10 +1564,22 @@ def inject_instance(
         "instance_id": iid,
         "repo": repo,
         "base_commit": base_commit,
+        "source_dataset": instance.get("source_dataset"),
+        "source_instance_id": instance.get("source_instance_id") or iid,
         "injection_level": None,
         "success": False,
         "failure_reason": None,
     }
+    injection_metrics = {
+        "level_runtime_seconds": {},
+        "level_attempts": {},
+        "level_retry_count": {},
+        "l3_prompt_tokens": 0,
+        "l3_completion_tokens": 0,
+        "l3_total_tokens": 0,
+        "l3_cost_usd": 0.0,
+    }
+    result["injection_metrics"] = injection_metrics
 
     # 1. Clone/update repo
     repo_dir = repos_dir / repo.replace("/", "__")
@@ -1246,22 +1621,40 @@ def inject_instance(
     wt_name = f"inject-{repo.replace('/', '-')}-{run_key}"
     wt_path = (worktrees_dir / wt_name).resolve()
     branch = f"inj-{run_key}"
-    cleanup_worktree_branch(repo_dir, branch, wt_path)
     print(f"  Creating worktree at {wt_path}...")
-    r = git("worktree", "add", "-b", branch, str(wt_path), f"origin/{default_branch}",
-            cwd=str(repo_dir), timeout=1200)
-    if r.returncode != 0:
-        # Check if it's just a stale branch issue
+    r = None
+    max_worktree_attempts = int(os.environ.get("PRI_WORKTREE_ADD_ATTEMPTS", "5"))
+    for attempt in range(1, max_worktree_attempts + 1):
+        cleanup_worktree_branch(repo_dir, branch, wt_path)
+        r = git("worktree", "add", "-b", branch, str(wt_path), f"origin/{default_branch}",
+                cwd=str(repo_dir), timeout=1200)
+        if r.returncode == 0:
+            break
         stderr_text = r.stderr.decode(errors="replace")
-        if "already exists" in stderr_text:
-            cleanup_worktree_branch(repo_dir, branch, wt_path)
-            r = git("worktree", "add", "-b", branch, str(wt_path), f"origin/{default_branch}",
-                    cwd=str(repo_dir), timeout=1200)
+        retryable = any(
+            marker in stderr_text
+            for marker in (
+                "could not lock config file",
+                "File exists",
+                "already exists",
+                "is already checked out",
+                "unable to write upstream branch",
+            )
+        )
+        if not retryable or attempt == max_worktree_attempts:
+            break
+        sleep_s = min(20.0, 1.5 * attempt)
+        print(
+            f"  [worktree] transient add failure on attempt "
+            f"{attempt}/{max_worktree_attempts}; retrying in {sleep_s:.1f}s"
+        )
+        time.sleep(sleep_s)
 
-    if r.returncode != 0:
-        err_msg = r.stderr.decode(errors="replace")[:500]
+    if r is None or r.returncode != 0:
+        err_msg = r.stderr.decode(errors="replace")[:500] if r is not None else "worktree add did not run"
         result["failure_reason"] = f"worktree_failed: {err_msg}"
-        print(f"  [FAIL] Worktree creation failed (rc={r.returncode}): {err_msg[:200]}")
+        rc = r.returncode if r is not None else "?"
+        print(f"  [FAIL] Worktree creation failed (rc={rc}): {err_msg[:200]}")
         return result
 
     print(f"  Worktree created successfully")
@@ -1276,9 +1669,14 @@ def inject_instance(
                 result["preflight"] = {"ok": False, "reason": "no_target_tests"}
                 print("  [preflight] Failed: no target tests")
                 return result
+            preflight_start = time.monotonic()
             preflight = run_target_preflight(
                 wt_path, repo, target_tests_to_run, test_timeout, max_target_tests
             )
+            injection_metrics["level_runtime_seconds"]["preflight"] = round(
+                time.monotonic() - preflight_start, 3
+            )
+            injection_metrics["level_attempts"]["preflight"] = 1
             result["preflight"] = preflight
             if not preflight.get("ok"):
                 result["injection_level"] = "Preflight_Failed"
@@ -1294,10 +1692,32 @@ def inject_instance(
             git("checkout", ".", cwd=str(wt_path))
             git("clean", "-fd", cwd=str(wt_path))
 
-        def attempt_level3() -> tuple[bool, str]:
+        def record_v2_gate(level: str, diff: str, stage: str) -> dict:
+            gate = evaluate_patch_pair_fidelity(
+                a_patch=patch,
+                b_patch=diff,
+                a_fail_to_pass=fail_to_pass,
+                b_fail_to_pass=target_tests_to_run,
+                a_pass_to_pass=pass_to_pass,
+                b_pass_to_pass=pass_to_pass,
+                injection_level=level,
+                config=v2_gate_config,
+            )
+            gate["stage"] = stage
+            result.setdefault("v2_fidelity_gate_by_level", {})[level] = gate
+            result["v2_fidelity_gate"] = gate
+            result["v2_fidelity_gate_pass"] = bool(gate.get("pass_gate"))
+            result["v2_fidelity_feedback_prompt"] = build_fidelity_feedback_prompt(gate)
+            return gate
+
+        def attempt_level3(retry_feedback_seed: str = "") -> tuple[bool, str]:
             if not enable_l3:
                 return False, "Level 3 disabled"
+            retry_feedback_seed = retry_feedback_seed or str(
+                instance.get("v2_retry_feedback_prompt") or ""
+            )
             print(f"  [L3] Attempting LLM semantic injection...")
+            l3_start = time.monotonic()
             problem = instance.get("problem_statement", "")
             if target_tests_to_run:
                 problem += (
@@ -1306,9 +1726,41 @@ def inject_instance(
                     + "\n".join(f"- {test}" for test in target_tests_to_run)
                 )
             ok3, l3_result, l3_meta = try_level3(
-                str(wt_path), str(repo_dir), base_commit, patch, problem
+                str(wt_path),
+                str(repo_dir),
+                base_commit,
+                patch,
+                problem,
+                target_tests_to_run,
+                fidelity_gate=v2_fidelity_gate,
+                fidelity_gate_config=v2_gate_config,
+                a_fail_to_pass=fail_to_pass,
+                b_fail_to_pass=target_tests_to_run,
+                a_pass_to_pass=pass_to_pass,
+                b_pass_to_pass=pass_to_pass,
+                retry_feedback_seed=retry_feedback_seed,
             )
             result["l3_metadata"] = l3_meta
+            injection_metrics["level_runtime_seconds"]["L3"] = round(
+                time.monotonic() - l3_start, 3
+            )
+            injection_metrics["level_attempts"]["L3"] = int(l3_meta.get("attempt") or 1)
+            injection_metrics["level_retry_count"]["L3"] = int(l3_meta.get("retry_count") or 0)
+            injection_metrics["l3_prompt_tokens"] = int(
+                l3_meta.get("total_prompt_tokens")
+                or l3_meta.get("prompt_tokens")
+                or 0
+            )
+            injection_metrics["l3_completion_tokens"] = int(
+                l3_meta.get("total_completion_tokens")
+                or l3_meta.get("completion_tokens")
+                or 0
+            )
+            injection_metrics["l3_total_tokens"] = (
+                injection_metrics["l3_prompt_tokens"]
+                + injection_metrics["l3_completion_tokens"]
+            )
+            injection_metrics["l3_cost_usd"] = float(l3_meta.get("total_cost_usd") or 0.0)
             if ok3:
                 print(
                     f"  [L3] Success! Diff size: {len(l3_result)} chars, "
@@ -1316,12 +1768,108 @@ def inject_instance(
                 )
                 result["injection_level"] = "Level_3_LLM_Semantic"
                 result["injected_diff"] = l3_result
+                if l3_meta.get("fidelity"):
+                    result["fidelity"] = l3_meta["fidelity"]
+                    result["complexity"] = l3_meta["fidelity"].get("generated")
+                if v2_fidelity_gate:
+                    gate = l3_meta.get("v2_fidelity_gate") or record_v2_gate(
+                        "Level_3_LLM_Semantic", l3_result, "construction_pre_verification"
+                    )
+                    gate["stage"] = gate.get("stage") or "construction_pre_verification"
+                    result.setdefault("v2_fidelity_gate_by_level", {})[
+                        "Level_3_LLM_Semantic"
+                    ] = gate
+                    result["v2_fidelity_gate"] = gate
+                    result["v2_fidelity_gate_pass"] = bool(gate.get("pass_gate"))
+                    result["v2_fidelity_feedback_prompt"] = (
+                        l3_meta.get("v2_fidelity_feedback_prompt")
+                        or build_fidelity_feedback_prompt(gate)
+                    )
+                    if v2_require_fidelity_gate and not gate.get("pass_gate"):
+                        result.setdefault("v2_fidelity_gate_failures", []).append({
+                            "level": "Level_3_LLM_Semantic",
+                            "gate": gate,
+                        })
+                        result["success"] = False
+                        result["injection_level"] = "Level_3_V2_Gate_Rejected"
+                        result["failure_reason"] = "v2_fidelity_gate_failed"
+                        return False, "v2_fidelity_gate_failed"
                 result["success"] = True
             else:
                 print(f"  [L3] Failed: {l3_result[:150]}")
                 result["failure_reason"] = l3_result
                 result["injection_level"] = "Level_3_Failed"
+                result["success"] = False
             return ok3, l3_result
+
+        def record_complexity(level: str, diff: str) -> dict:
+            profile = _l3_fidelity_profile(diff, patch)
+            result.setdefault("fidelity_by_level", {})[level] = profile
+            result["fidelity"] = profile
+            result["complexity"] = profile.get("generated")
+            return profile
+
+        def accept_or_retry_complexity(level: str, diff: str) -> bool:
+            profile = record_complexity(level, diff)
+            if v2_fidelity_gate:
+                gate = record_v2_gate(level, diff, "construction_pre_verification")
+                if gate.get("pass_gate"):
+                    return True
+                result.setdefault("v2_fidelity_gate_failures", []).append({
+                    "level": level,
+                    "gate": gate,
+                })
+                result["v2_gate_rejected_level"] = level
+                result["v2_gate_rejection_profile"] = gate
+                print(
+                    "  [v2-gate] Fidelity gate failed for "
+                    f"{level}: score={gate.get('score')} tags={gate.get('tags')}; "
+                    "retrying with L3 if enabled..."
+                )
+                if enable_l3 and env_bool("PRI_RETRY_V2_GATE_WITH_L3", True):
+                    git("checkout", ".", cwd=str(wt_path))
+                    git("clean", "-fd", cwd=str(wt_path))
+                    ok3, _ = attempt_level3(result.get("v2_fidelity_feedback_prompt", ""))
+                    if ok3:
+                        result["v2_retry_from_level"] = level
+                        return True
+                    return False
+                if v2_require_fidelity_gate:
+                    result["success"] = False
+                    result["injection_level"] = f"{level}_V2_Gate_Rejected"
+                    result["failure_reason"] = "v2_fidelity_gate_failed"
+                    return False
+                return True
+            if not _complexity_mismatch(profile):
+                return True
+            result["complexity_rejected_level"] = level
+            result["complexity_rejection_profile"] = profile
+            print(
+                "  [fidelity] Complexity mismatch for "
+                f"{level}: {profile.get('fidelity_reasons')}; "
+                "retrying with L3 if enabled..."
+            )
+            if (
+                enable_l3
+                and os.environ.get("PRI_RETRY_COMPLEXITY_MISMATCH_WITH_L3", "1").lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                git("checkout", ".", cwd=str(wt_path))
+                git("clean", "-fd", cwd=str(wt_path))
+                ok3, _ = attempt_level3()
+                if ok3:
+                    result["complexity_retry_from_level"] = level
+                    return True
+                return False
+            if (
+                os.environ.get("PRI_REJECT_COMPLEXITY_MISMATCH", "1").lower()
+                in {"1", "true", "yes", "on"}
+            ):
+                result["success"] = False
+                result["injection_level"] = f"{level}_Complexity_Rejected"
+                result["failure_reason"] = "complexity_mismatch_with_original_patch"
+                return False
+            return True
 
         if os.environ.get("PRI_FORCE_L3_SEMANTIC") == "1":
             print("  [L3] Forced semantic retry mode enabled; skipping L1/L2.")
@@ -1332,13 +1880,25 @@ def inject_instance(
             return result
 
         # 3. Try Level 1
-        print(f"  [L1] Attempting exact reverse apply...")
-        ok, l1_result = try_level1(str(wt_path), patch)
+        skip_l1 = env_bool("PRI_SKIP_L1", False)
+        if skip_l1:
+            print("  [L1] Skipped by PRI_SKIP_L1=1")
+            ok, l1_result = False, "Level 1 skipped"
+            injection_metrics["level_attempts"]["L1"] = 0
+        else:
+            print(f"  [L1] Attempting exact reverse apply...")
+            l1_start = time.monotonic()
+            ok, l1_result = try_level1(str(wt_path), patch)
+            injection_metrics["level_runtime_seconds"]["L1"] = round(
+                time.monotonic() - l1_start, 3
+            )
+            injection_metrics["level_attempts"]["L1"] = 1
         if ok:
             print(f"  [L1] Success! Diff size: {len(l1_result)} chars")
             result["injection_level"] = "Level_1_Clean_Revert"
             result["injected_diff"] = l1_result
             result["success"] = True
+            accept_or_retry_complexity("Level_1_Clean_Revert", l1_result)
         else:
             print(f"  [L1] Failed: {l1_result[:100]}")
 
@@ -1347,14 +1907,27 @@ def inject_instance(
             git("clean", "-fd", cwd=str(wt_path))
 
             # 4. Try Level 2
-            print(f"  [L2] Attempting AST surgery...")
-            ok, l2_result, l2_meta = try_level2(str(wt_path), str(repo_dir), base_commit, patch)
-            result["l2_metadata"] = l2_meta
+            skip_l2 = env_bool("PRI_SKIP_L2", False)
+            if skip_l2:
+                print("  [L2] Skipped by PRI_SKIP_L2=1")
+                ok, l2_result, l2_meta = False, "Level 2 skipped", {}
+                injection_metrics["level_attempts"]["L2"] = 0
+                result["l2_metadata"] = l2_meta
+            else:
+                print(f"  [L2] Attempting AST surgery...")
+                l2_start = time.monotonic()
+                ok, l2_result, l2_meta = try_level2(str(wt_path), str(repo_dir), base_commit, patch)
+                injection_metrics["level_runtime_seconds"]["L2"] = round(
+                    time.monotonic() - l2_start, 3
+                )
+                injection_metrics["level_attempts"]["L2"] = 1
+                result["l2_metadata"] = l2_meta
             if ok:
                 print(f"  [L2] Success! Diff size: {len(l2_result)} chars")
                 result["injection_level"] = "Level_2_AST_Surgery"
                 result["injected_diff"] = l2_result
                 result["success"] = True
+                accept_or_retry_complexity("Level_2_AST_Surgery", l2_result)
             else:
                 print(f"  [L2] Failed: {l2_result[:100]}")
                 if l2_meta.get("compatibility_rejected_files"):
@@ -1404,6 +1977,16 @@ def main():
                         help="Before injection, require target tests to exist, collect, and pass on healthy HEAD")
     parser.add_argument("--max-target-tests", type=int, default=None,
                         help="With preflight, skip instances with more target nodeids than this")
+    parser.add_argument("--v2-fidelity-gate", action="store_true",
+                        help="Annotate each successful injection with the PR-INJECTOR v2 A/B complexity gate")
+    parser.add_argument("--v2-require-fidelity-gate", action="store_true",
+                        help="Reject successful injections that fail the v2 fidelity gate; retries with L3 when enabled")
+    parser.add_argument("--v2-min-score", type=float, default=0.65)
+    parser.add_argument("--v2-min-line-ratio", type=float, default=0.50)
+    parser.add_argument("--v2-max-line-ratio", type=float, default=2.50)
+    parser.add_argument("--v2-min-hunk-ratio", type=float, default=0.50)
+    parser.add_argument("--v2-min-file-ratio", type=float, default=0.50)
+    parser.add_argument("--v2-min-regression-ratio", type=float, default=0.25)
     parser.add_argument("--force", action="store_true",
                         help="Re-run instances even if an output row already exists")
     args = parser.parse_args()
@@ -1439,6 +2022,14 @@ def main():
 
     print(f"Instances to process: {len(instances)}")
     print(f"Output: {args.output}")
+    v2_gate_config = FidelityGateConfig(
+        min_score=args.v2_min_score,
+        min_line_ratio=args.v2_min_line_ratio,
+        max_line_ratio=args.v2_max_line_ratio,
+        min_hunk_ratio=args.v2_min_hunk_ratio,
+        min_file_ratio=args.v2_min_file_ratio,
+        min_regression_ratio=args.v2_min_regression_ratio,
+    )
 
     # Run injection. Keep this resumable because large construction sweeps can
     # take many hours and may be interrupted by dependency/network failures.
@@ -1462,12 +2053,16 @@ def main():
             )
             continue
 
+        instance_start = time.monotonic()
         try:
             result = inject_instance(
                 inst, repos_dir, worktrees_dir, args.timeout,
                 enable_l3=args.enable_l3 and not args.no_l3,
                 preflight_target_tests=args.preflight_target_tests,
                 max_target_tests=args.max_target_tests,
+                v2_fidelity_gate=args.v2_fidelity_gate or args.v2_require_fidelity_gate,
+                v2_require_fidelity_gate=args.v2_require_fidelity_gate,
+                v2_gate_config=v2_gate_config,
             )
         except Exception as e:
             print(f"  [ERROR] {e}")
@@ -1477,6 +2072,8 @@ def main():
                 "success": False,
                 "failure_reason": f"exception: {str(e)[:200]}",
             }
+        result["candidate_ordinal"] = i
+        result["injection_duration_seconds"] = round(time.monotonic() - instance_start, 2)
 
         # Save diff to file, store relative path in result
         diff_content = result.pop("injected_diff", None)
@@ -1508,7 +2105,8 @@ def main():
         if inst["instance_id"] in results_by_id
     ]
     stats = {"total": len(final_rows), "l1_success": 0, "l2_success": 0, "l3_success": 0,
-             "l3_failed": 0, "l2_failed": 0, "errors": 0}
+             "l3_failed": 0, "l2_failed": 0, "errors": 0,
+             "v2_gate_pass": 0, "v2_gate_fail": 0}
     for row in final_rows:
         level = row.get("injection_level")
         if level == "Level_1_Clean_Revert":
@@ -1523,6 +2121,11 @@ def main():
             stats["l2_failed"] += 1
         elif str(row.get("failure_reason", "")).startswith("exception:"):
             stats["errors"] += 1
+        if row.get("v2_fidelity_gate"):
+            if row.get("v2_fidelity_gate_pass"):
+                stats["v2_gate_pass"] += 1
+            else:
+                stats["v2_gate_fail"] += 1
     t = stats["total"]
     l_success = stats["l1_success"] + stats["l2_success"] + stats["l3_success"]
     print(f"\n\n{'=' * 70}")
@@ -1536,6 +2139,9 @@ def main():
     print(f"  Level 3 failed      : {stats['l3_failed']}")
     print(f"  Level 2 failed      : {stats['l2_failed']}")
     print(f"  Errors              : {stats['errors']}")
+    if args.v2_fidelity_gate or args.v2_require_fidelity_gate:
+        print(f"  V2 gate pass        : {stats['v2_gate_pass']}")
+        print(f"  V2 gate fail        : {stats['v2_gate_fail']}")
     print(f"  Injection rate      : {l_success/denom*100:.1f}%")
     print(f"\n  Results saved to: {args.output}")
     print(f"  Log saved to: {log_path}")

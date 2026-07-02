@@ -9,6 +9,7 @@ import os
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -155,7 +156,11 @@ def main() -> None:
             system_path.read_text(encoding="utf-8", errors="ignore"),
             "TASK INSTRUCTIONS:",
             task_path.read_text(encoding="utf-8", errors="ignore"),
-            "Runner note: edit this repository directly. Do not wait for human approval. When finished, leave only the source-code repair patch in the working tree.",
+            "Runner note: edit this repository directly. Do not wait for human approval. "
+            "When finished, leave only the source-code repair patch in the working tree.",
+            "Hard evaluation rule: never create, edit, delete, rename, stage, or commit tests, "
+            "test fixtures, benchmark metadata, CI files, or project test configuration. "
+            "Use /tmp for scratch files. Any forbidden-file change invalidates the run.",
         ]
     )
     prompt_path = out_path.parent / "opencode_prompt.txt"
@@ -193,7 +198,7 @@ def main() -> None:
     env["XDG_CACHE_HOME"] = str(state_root / "cache")
     env["OPENCODE_DISABLE_TELEMETRY"] = "1"
 
-    pre_status = run_git(repo, ["status", "--porcelain=v1", "-uno"])
+    pre_status = run_git(repo, ["status", "--porcelain=v1"])
     pre_diff = run_git(repo, ["diff"])
     start = time.time()
     proc = subprocess.Popen(
@@ -206,6 +211,19 @@ def main() -> None:
         env=env,
     )
     timed_out = False
+    watchdog_fired = False
+
+    def watchdog_kill() -> None:
+        nonlocal watchdog_fired
+        watchdog_fired = True
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except Exception:
+            pass
+
+    watchdog = threading.Timer(args.timeout_s, watchdog_kill)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         stdout, stderr = proc.communicate(timeout=args.timeout_s)
         returncode = int(proc.returncode) if proc.returncode is not None else 0
@@ -223,6 +241,12 @@ def main() -> None:
         stdout = ""
         stderr = f"[opencode_timeout] timeout_s={args.timeout_s}\n"
         returncode = 124
+    finally:
+        watchdog.cancel()
+    if watchdog_fired and returncode == 0:
+        timed_out = True
+        returncode = 124
+        stderr = (stderr or "") + f"\n[opencode_watchdog_timeout] timeout_s={args.timeout_s}\n"
 
     opencode_error = extract_error_from_jsonl(stdout or "")
     result_text = extract_text_from_jsonl(stdout or "")
@@ -234,8 +258,8 @@ def main() -> None:
     stderr_path.write_text(stderr or "", encoding="utf-8", errors="ignore")
     result_path.write_text(result_text, encoding="utf-8", errors="ignore")
 
-    post_status = run_git(repo, ["status", "--porcelain=v1", "-uno"])
-    post_diff = run_git(repo, ["diff"])
+    post_status = run_git(repo, ["status", "--porcelain=v1"])
+    post_diff = run_git(repo, ["diff", "--binary", "HEAD", "--"])
     payload = {
         "cmd": cmd,
         "cwd": str(repo),

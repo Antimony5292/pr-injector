@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}"
+cd /Users/harmin/Desktop/pr-injector-main
 
 FINAL_DIR="experiments/rq2_500/rq2_b_500_final_20260608"
 PAIRING="${FINAL_DIR}/rq2_pairing_table.jsonl"
@@ -14,7 +13,7 @@ MODEL="gpt-5.5"
 LOG_DIR="experiments/rq2_500/logs"
 LOG_FILE="${LOG_DIR}/rq2_codex_cli_a500_fixed_harness_official_20260609.log"
 METRICS_FILE="experiments/rq2_500/rq3_metrics_codex_cli_a500_fixed_harness_20260609.json"
-BUNDLED_PYTHON="${BUNDLED_PYTHON:-python3}"
+BUNDLED_PYTHON="/Users/harmin/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 PYTHON_BIN="${PYTHON_BIN:-${BUNDLED_PYTHON}}"
 export PYTHONDONTWRITEBYTECODE=1
 export PYTHONNOUSERSITE=1

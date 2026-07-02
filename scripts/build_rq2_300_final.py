@@ -17,6 +17,8 @@ import sys
 from collections import Counter, defaultdict
 from pathlib import Path
 
+from prinjector_v2_metrics import FidelityGateConfig, evaluate_patch_pair_fidelity
+
 ROOT = Path(__file__).resolve().parent.parent
 RQ2_100_FINAL = ROOT / "experiments" / "rq2_100" / "rq2_b_l1_l2_original_100_final_20260605"
 RQ2_300 = ROOT / "experiments" / "rq2_300"
@@ -135,7 +137,97 @@ def complexity(row: dict, diff: str) -> dict:
     }
 
 
-def strict_ok(row: dict, injection: dict, args: argparse.Namespace) -> tuple[bool, str]:
+def diff_profile(diff: str) -> dict:
+    files = diff_files(diff)
+    source_files = [path for path in files if not touches_test_file([path])]
+    added = sum(1 for line in diff.splitlines() if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff.splitlines() if line.startswith("-") and not line.startswith("---"))
+    hunks = sum(1 for line in diff.splitlines() if line.startswith("@@ "))
+    hunk_sections = [
+        line.rsplit("@@", 1)[-1].strip()
+        for line in diff.splitlines()
+        if line.startswith("@@ ")
+    ]
+    return {
+        "files": len(set(files)),
+        "source_files": len(set(source_files)),
+        "test_files": len(set(files)) - len(set(source_files)),
+        "hunks": hunks,
+        "added": added,
+        "removed": removed,
+        "line_changes": added + removed,
+        "hunk_sections": len(set(section for section in hunk_sections if section)),
+        "modules": len(set(str(Path(path).parent) for path in source_files)),
+    }
+
+
+def fidelity_assessment(candidate: dict, injection: dict, injected_diff: str, args: argparse.Namespace) -> dict:
+    original = diff_profile(candidate.get("patch", "") or injection.get("patch", ""))
+    injected = diff_profile(injected_diff)
+    original_lines = max(int(original["line_changes"] or 0), 1)
+    original_hunks = max(int(original["hunks"] or 0), 1)
+    line_ratio = injected["line_changes"] / original_lines
+    hunk_ratio = injected["hunks"] / original_hunks
+    file_ratio = injected["source_files"] / max(int(original["source_files"] or 0), 1)
+    tags: list[str] = []
+    reasons: list[str] = []
+
+    if original["source_files"] >= 2 and injected["source_files"] <= 1:
+        tags.append("localized_simplified")
+        reasons.append("source_file_count_collapsed")
+    if original["hunks"] >= 3 and hunk_ratio < args.min_injected_to_original_hunk_ratio:
+        tags.append("localized_simplified")
+        reasons.append("hunk_count_collapsed")
+    if original["line_changes"] >= 20 and line_ratio < args.min_injected_to_original_line_ratio:
+        tags.append("over_simplified")
+        reasons.append("line_change_count_collapsed")
+    if original["modules"] >= 2 and injected["modules"] <= 1:
+        tags.append("localized_simplified")
+        reasons.append("module_count_collapsed")
+    if injected["line_changes"] <= args.min_injected_line_changes and original["line_changes"] >= 12:
+        tags.append("over_simplified")
+        reasons.append("injected_diff_too_small")
+
+    level = str(injection.get("injection_level", ""))
+    l2_meta = injection.get("l2_metadata") or {}
+    l3_meta = injection.get("l3_metadata") or {}
+    if l2_meta.get("compatibility_flagged_files") or l2_meta.get("compatibility_rejected_files"):
+        tags.append("api_drift")
+        reasons.append("compatibility_flags")
+    if level.startswith("Level_2") and l2_meta.get("function_replacements") and not l2_meta.get("hunk_replacements"):
+        tags.append("localized_simplified")
+        reasons.append("level2_whole_function_only")
+    if level.startswith("Level_3") and l3_meta.get("simplification_risk"):
+        tags.append("over_simplified")
+        reasons.append("level3_marked_simplification_risk")
+
+    if not tags:
+        tags.append("faithful")
+    return {
+        "original": original,
+        "injected": injected,
+        "ratios": {
+            "source_file_ratio": round(file_ratio, 4),
+            "hunk_ratio": round(hunk_ratio, 4),
+            "line_change_ratio": round(line_ratio, 4),
+        },
+        "tags": sorted(set(tags)),
+        "reasons": sorted(set(reasons)),
+    }
+
+
+def v2_gate_config_from_args(args: argparse.Namespace) -> FidelityGateConfig:
+    return FidelityGateConfig(
+        min_score=args.v2_min_score,
+        min_line_ratio=args.v2_min_line_ratio,
+        max_line_ratio=args.v2_max_line_ratio,
+        min_hunk_ratio=args.v2_min_hunk_ratio,
+        min_file_ratio=args.v2_min_file_ratio,
+        min_regression_ratio=args.v2_min_regression_ratio,
+    )
+
+
+def strict_ok(row: dict, injection: dict, args: argparse.Namespace, candidate: dict | None = None) -> tuple[bool, str]:
     verification = row.get("verification") or {}
     level = str(injection.get("injection_level", ""))
     if not injection.get("success"):
@@ -159,6 +251,8 @@ def strict_ok(row: dict, injection: dict, args: argparse.Namespace) -> tuple[boo
             return False, "compatibility_rejected"
         if args.reject_compatibility_flags and l2_meta.get("compatibility_flagged_files"):
             return False, "compatibility_flagged"
+        if args.reject_whole_function_level2 and l2_meta.get("function_replacements") and not l2_meta.get("hunk_replacements"):
+            return False, "level2_whole_function_only"
     l3_meta = injection.get("l3_metadata") or {}
     if level.startswith("Level_3"):
         if l3_meta.get("disabled") or l3_meta.get("invalid_files"):
@@ -168,6 +262,28 @@ def strict_ok(row: dict, injection: dict, args: argparse.Namespace) -> tuple[boo
     diff = diff_text(injection)
     if not diff.strip():
         return False, "diff_missing"
+    fidelity = fidelity_assessment(candidate or injection, injection, diff, args)
+    injection["_fidelity_assessment"] = fidelity
+    if args.require_v2_fidelity_gate:
+        source = candidate or injection
+        v2_gate = evaluate_patch_pair_fidelity(
+            a_patch=source.get("patch") or injection.get("patch", ""),
+            b_patch=diff,
+            a_fail_to_pass=source.get("fail_to_pass") or source.get("FAIL_TO_PASS") or [],
+            b_fail_to_pass=verification.get("actual_failed_tests") or injection.get("fail_to_pass") or [],
+            a_pass_to_pass=source.get("pass_to_pass") or source.get("PASS_TO_PASS") or [],
+            b_pass_to_pass=clean_p2p,
+            injection_level=level,
+            config=v2_gate_config_from_args(args),
+        )
+        v2_gate["stage"] = "final_strict_verified"
+        injection["_v2_fidelity_gate_final"] = v2_gate
+        if not v2_gate.get("pass_gate"):
+            return False, "v2_fidelity_gate_failed"
+    if args.reject_over_simplified and "over_simplified" in fidelity["tags"]:
+        return False, "over_simplified"
+    if args.reject_localized_simplified and "localized_simplified" in fidelity["tags"]:
+        return False, "localized_simplified"
     files = diff_files(diff)
     if touches_test_file(files):
         return False, "diff_touches_tests"
@@ -212,11 +328,11 @@ def collect_run_candidates(
         if not injection:
             rejects["missing_injection"] += 1
             continue
-        ok, reason = strict_ok(verification_row, injection, args)
+        candidate = candidate_meta.get(iid, {})
+        ok, reason = strict_ok(verification_row, injection, args, candidate)
         if not ok:
             rejects[reason] += 1
             continue
-        candidate = candidate_meta.get(iid, {})
         verification = verification_row.get("verification") or {}
         fail_to_pass = (
             verification.get("actual_failed_tests")
@@ -254,6 +370,14 @@ def collect_run_candidates(
         dtext = diff_text(merged)
         merged["injected_diff_hash"] = diff_hash(dtext)
         merged["complexity"] = complexity(merged, dtext)
+        merged["fidelity"] = injection.get("_fidelity_assessment") or fidelity_assessment(candidate, merged, dtext, args)
+        if injection.get("_v2_fidelity_gate_final"):
+            merged["v2_fidelity_gate_final"] = injection["_v2_fidelity_gate_final"]
+            merged["v2_fidelity_gate_pass_final"] = bool(
+                injection["_v2_fidelity_gate_final"].get("pass_gate")
+            )
+        merged.pop("_fidelity_assessment", None)
+        merged.pop("_v2_fidelity_gate_final", None)
         out.append(merged)
     return out, rejects
 
@@ -262,13 +386,21 @@ def load_seed_rows(seed_final_dir: Path, args: argparse.Namespace) -> list[dict]
     rows: list[dict] = []
     for row in read_jsonl(seed_final_dir / "injection_results.jsonl"):
         fake_verification_row = {"verification": row.get("verification") or {}}
-        ok, reason = strict_ok(fake_verification_row, row, args)
+        ok, reason = strict_ok(fake_verification_row, row, args, row)
         if not ok:
             continue
         dtext = diff_text(row)
         row = dict(row)
         row["injected_diff_hash"] = diff_hash(dtext)
         row["complexity"] = complexity(row, dtext)
+        row["fidelity"] = row.get("_fidelity_assessment") or fidelity_assessment(row, row, dtext, args)
+        if row.get("_v2_fidelity_gate_final"):
+            row["v2_fidelity_gate_final"] = row["_v2_fidelity_gate_final"]
+            row["v2_fidelity_gate_pass_final"] = bool(
+                row["_v2_fidelity_gate_final"].get("pass_gate")
+            )
+        row.pop("_fidelity_assessment", None)
+        row.pop("_v2_fidelity_gate_final", None)
         row["construction_run_dir"] = str(seed_final_dir)
         rows.append(row)
     return rows
@@ -281,6 +413,24 @@ def select_diverse(
     pinned_rows: list[dict] | None = None,
     max_repo_count: int = 0,
 ) -> list[dict]:
+    def bucket(value: int | float, cuts: tuple[int, ...] = (1, 2, 4, 8, 16, 32, 64, 128)) -> str:
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            v = 0.0
+        for cut in cuts:
+            if v <= cut:
+                return f"<= {cut}"
+        return f"> {cuts[-1]}"
+
+    def diversity_shape(row: dict) -> tuple[str, str, str]:
+        c = row.get("complexity") or {}
+        return (
+            bucket(c.get("diff_files") or 0, (1, 2, 3, 5, 8)),
+            bucket(c.get("diff_hunks") or 0, (1, 2, 4, 8, 16)),
+            bucket(c.get("diff_line_changes") or 0, (4, 8, 16, 32, 64, 128)),
+        )
+
     by_id: dict[str, dict] = {}
     for row in rows:
         iid = row.get("source_instance_id") or row.get("instance_id")
@@ -295,6 +445,10 @@ def select_diverse(
     seen_diff_hashes: set[str] = set()
     repo_counts: Counter = Counter()
     level_counts: Counter = Counter()
+    dataset_counts: Counter = Counter()
+    file_bucket_counts: Counter = Counter()
+    hunk_bucket_counts: Counter = Counter()
+    line_bucket_counts: Counter = Counter()
 
     for row in pinned_rows or []:
         iid = row.get("source_instance_id") or row.get("instance_id")
@@ -306,6 +460,11 @@ def select_diverse(
         selected.append(row)
         repo_counts[row.get("repo", "")] += 1
         level_counts[str(row.get("injection_level", ""))] += 1
+        dataset_counts[row.get("source_dataset", "")] += 1
+        file_bucket, hunk_bucket, line_bucket = diversity_shape(row)
+        file_bucket_counts[file_bucket] += 1
+        hunk_bucket_counts[hunk_bucket] += 1
+        line_bucket_counts[line_bucket] += 1
         if h:
             seen_diff_hashes.add(h)
         by_id.pop(iid, None)
@@ -316,8 +475,12 @@ def select_diverse(
     while candidates and len(selected) < limit:
         candidates.sort(
             key=lambda row: (
+                dataset_counts[row.get("source_dataset", "")],
                 repo_counts[row.get("repo", "")],
                 level_counts[str(row.get("injection_level", ""))],
+                file_bucket_counts[diversity_shape(row)[0]],
+                hunk_bucket_counts[diversity_shape(row)[1]],
+                line_bucket_counts[diversity_shape(row)[2]],
                 -float(row.get("complexity", {}).get("score") or 0),
                 row.get("source_instance_id", ""),
             )
@@ -346,6 +509,11 @@ def select_diverse(
         selected.append(picked)
         repo_counts[picked.get("repo", "")] += 1
         level_counts[str(picked.get("injection_level", ""))] += 1
+        dataset_counts[picked.get("source_dataset", "")] += 1
+        file_bucket, hunk_bucket, line_bucket = diversity_shape(picked)
+        file_bucket_counts[file_bucket] += 1
+        hunk_bucket_counts[hunk_bucket] += 1
+        line_bucket_counts[line_bucket] += 1
         if picked.get("injected_diff_hash"):
             seen_diff_hashes.add(picked["injected_diff_hash"])
 
@@ -395,6 +563,20 @@ def main() -> None:
     parser.add_argument("--min-l3-confidence", type=float, default=0.45)
     parser.add_argument("--min-clean-p2p", type=int, default=1)
     parser.add_argument("--reject-compatibility-flags", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--reject-whole-function-level2", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reject-localized-simplified", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reject-over-simplified", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--min-injected-to-original-line-ratio", type=float, default=0.20)
+    parser.add_argument("--min-injected-to-original-hunk-ratio", type=float, default=0.35)
+    parser.add_argument("--min-injected-line-changes", type=int, default=4)
+    parser.add_argument("--require-v2-fidelity-gate", action="store_true",
+                        help="Require the verified A/B v2 complexity gate before final selection")
+    parser.add_argument("--v2-min-score", type=float, default=0.65)
+    parser.add_argument("--v2-min-line-ratio", type=float, default=0.50)
+    parser.add_argument("--v2-max-line-ratio", type=float, default=2.50)
+    parser.add_argument("--v2-min-hunk-ratio", type=float, default=0.50)
+    parser.add_argument("--v2-min-file-ratio", type=float, default=0.50)
+    parser.add_argument("--v2-min-regression-ratio", type=float, default=0.25)
     parser.add_argument("--max-diff-files", type=int, default=8)
     parser.add_argument("--max-diff-line-changes", type=int, default=600)
     parser.add_argument("--pin-seed", action="store_true",
@@ -513,6 +695,15 @@ def main() -> None:
         "levels": dict(Counter(row.get("injection_level") for row in selected)),
         "repos": dict(Counter(row.get("repo") for row in selected)),
         "level3_rows": sum(str(row.get("injection_level", "")).startswith("Level_3") for row in selected),
+        "fidelity_tags": dict(Counter(tag for row in selected for tag in row.get("fidelity", {}).get("tags", []))),
+        "fidelity_reasons": dict(Counter(reason for row in selected for reason in row.get("fidelity", {}).get("reasons", []))),
+        "require_v2_fidelity_gate": args.require_v2_fidelity_gate,
+        "v2_gate_pass_final": sum(bool(row.get("v2_fidelity_gate_pass_final")) for row in selected),
+        "v2_gate_tags_final": dict(Counter(
+            tag
+            for row in selected
+            for tag in (row.get("v2_fidelity_gate_final") or {}).get("tags", [])
+        )),
         "diff_file_count_histogram": dict(Counter(row["complexity"]["diff_files"] for row in selected)),
         "source_patch_file_count_histogram": dict(Counter(row["complexity"]["original_patch_files"] for row in selected)),
         "candidate_paths": [str(p) for p in candidate_paths],

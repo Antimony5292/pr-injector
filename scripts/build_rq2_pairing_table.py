@@ -246,6 +246,10 @@ def main() -> None:
             "B_buggy_failed": verification.get("buggy_failed"),
             "B_golden_repair_pass": verification.get("golden_repair_pass"),
             "B_p2p_repaired_pass": verification.get("p2p_repaired_pass"),
+            "B_complexity": row.get("complexity", {}),
+            "B_fidelity": row.get("fidelity", {}),
+            "B_fidelity_tags": (row.get("fidelity") or {}).get("tags", []),
+            "B_fidelity_reasons": (row.get("fidelity") or {}).get("reasons", []),
             "rq2_eval_pair_key": f"{row['source_dataset']}::{row['source_instance_id']}",
         })
 

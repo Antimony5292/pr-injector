@@ -19,6 +19,7 @@ import signal
 import shutil
 import subprocess
 import sys
+import threading
 import textwrap
 import time
 from fnmatch import fnmatch
@@ -28,15 +29,8 @@ ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 PAIRING = ROOT / "experiments" / "rq2_100" / "rq2_b_p2f_100_final" / "rq2_pairing_table.jsonl"
-CLAUDE_WRAPPER = Path(
-    os.environ.get(
-        "PRI_CLAUDE_WRAPPER",
-        str(ROOT / "scripts" / "run_claude_inject_bedrock.py"),
-    )
-).expanduser()
-CODEX_BUNDLED_PYTHON = Path(
-    os.environ.get("CODEX_BUNDLED_PYTHON", sys.executable)
-).expanduser()
+CLAUDE_WRAPPER = Path("/Users/harmin/Desktop/BenchInject/BenchInject-file/scripts/run_claude_inject_bedrock.py")
+CODEX_BUNDLED_PYTHON = Path("/Users/harmin/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3")
 DEFAULT_MODEL = "arn:aws:bedrock:us-west-2:497589205881:inference-profile/global.anthropic.claude-sonnet-4-6"
 CLAUDE_BIN = shutil.which("claude") or "claude"
 DEFAULT_CODEX_RUNNER = ROOT / "scripts" / "run_codex_headless.py"
@@ -73,6 +67,11 @@ GENERIC_INFRA_STOP_ERRORS = (
 )
 
 GENERIC_INFRA_RETRY_ERRORS = (
+    "APIConnectionError",
+    "ConnectionError",
+    "ReadTimeout",
+    "ConnectTimeout",
+    "Connection reset",
     "ThrottlingException",
     "TooManyRequestsException",
     "ServiceUnavailable",
@@ -196,12 +195,19 @@ def agent_error_text(payload: dict) -> str:
                 raw.get("stderr"),
                 raw.get("result"),
                 raw.get("opencode_error"),
+                raw.get("last_error"),
+                raw.get("failure_class"),
             ]
         )
     return compact_text("\n".join(str(p) for p in parts if p), 2000)
 
 
 def is_generic_infra_failure(payload: dict) -> bool:
+    raw = payload.get("raw") if isinstance(payload, dict) else {}
+    if isinstance(raw, dict) and raw.get("failure_class") == "bedrock_transient":
+        return True
+    if payload.get("timed_out") or (isinstance(raw, dict) and raw.get("failure_class") == "timeout"):
+        return False
     text = agent_error_text(payload)
     if not text:
         return False
@@ -209,6 +215,9 @@ def is_generic_infra_failure(payload: dict) -> bool:
 
 
 def is_retryable_generic_infra_failure(payload: dict) -> bool:
+    raw = payload.get("raw") if isinstance(payload, dict) else {}
+    if isinstance(raw, dict) and raw.get("retryable_infra") is True:
+        return True
     text = agent_error_text(payload)
     if any(pattern in text for pattern in GENERIC_INFRA_STOP_ERRORS):
         return False
@@ -232,7 +241,7 @@ def python_shims_dir() -> Path:
         return shim_dir
     for name in ("python", "python3", "python3.12", "python3.13"):
         shim = shim_dir / name
-        shim.write_text(f"#!/usr/bin/env bash\nexec \"{bundled}\" \"$@\"\n", encoding="utf-8")
+        shim.write_text(f"#!/usr/bin/env bash\nexec {bundled} \"$@\"\n", encoding="utf-8")
         shim.chmod(0o755)
     return shim_dir
 
@@ -241,12 +250,8 @@ def build_claude_env(aws_region: str, aws_profile: str, model: str) -> dict[str,
     env = os.environ.copy()
     home = claude_home()
     shims = python_shims_dir()
-    aws_credentials = Path(
-        os.environ.get("AWS_SHARED_CREDENTIALS_FILE", str(Path.home() / ".aws" / "credentials"))
-    ).expanduser()
-    aws_config = Path(
-        os.environ.get("AWS_CONFIG_FILE", str(Path.home() / ".aws" / "config"))
-    ).expanduser()
+    aws_credentials = Path("/Users/harmin/.aws/credentials")
+    aws_config = Path("/Users/harmin/.aws/config")
 
     env.setdefault("PYTHONFAULTHANDLER", "1")
     env.setdefault("PYTHONNOUSERSITE", "1")
@@ -408,7 +413,7 @@ def git_status_short(worktree: Path) -> str:
 
 
 def git_diff_text(worktree: Path) -> str:
-    proc = run(["git", "diff"], worktree, timeout=120)
+    proc = run(["git", "diff", "--binary", "HEAD", "--"], worktree, timeout=120)
     return proc.stdout if proc.returncode == 0 else ""
 
 
@@ -583,9 +588,10 @@ def create_venv(worktree: Path) -> str:
         ensurepip = run([str(vpy), "-m", "ensurepip", "--upgrade"], worktree, timeout=240)
         if ensurepip.returncode != 0:
             raise RuntimeError(f"pip unavailable in venv: {ensurepip.stderr[-1000:]}")
-    upgraded = run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"], worktree, timeout=240)
-    if upgraded.returncode != 0:
-        raise RuntimeError(f"pip bootstrap failed: {upgraded.stderr[-1000:]}")
+    if os.environ.get("PRI_RQ2_BOOTSTRAP_PIP", "0") == "1":
+        upgraded = run([str(vpy), "-m", "pip", "install", "-q", "--upgrade", "pip", "setuptools", "wheel"], worktree, timeout=240)
+        if upgraded.returncode != 0:
+            raise RuntimeError(f"pip bootstrap failed: {upgraded.stderr[-1000:]}")
     return str(vpy)
 
 
@@ -632,10 +638,17 @@ def strict_eval_solved(
 
 
 def git_changed_files(worktree: Path) -> list[str]:
-    proc = run(["git", "diff", "--name-only"], worktree, timeout=120)
-    if proc.returncode != 0:
-        return []
-    return [line.strip() for line in proc.stdout.splitlines() if line.strip()]
+    paths: set[str] = set()
+    commands = [
+        ["git", "diff", "--name-only", "--no-renames", "HEAD", "--"],
+        ["git", "ls-files", "--others", "--exclude-standard"],
+    ]
+    for command in commands:
+        proc = run(command, worktree, timeout=120)
+        if proc.returncode != 0:
+            continue
+        paths.update(line.strip() for line in proc.stdout.splitlines() if line.strip())
+    return sorted(paths)
 
 
 def is_forbidden_agent_edit(path: str) -> bool:
@@ -645,6 +658,61 @@ def is_forbidden_agent_edit(path: str) -> bool:
 
 def forbidden_agent_edits(paths: list[str]) -> list[str]:
     return sorted({p for p in paths if is_forbidden_agent_edit(p)})
+
+
+def restore_forbidden_agent_edits(worktree: Path, paths: list[str]) -> dict:
+    """Remove forbidden edits after preserving the agent patch for auditing."""
+
+    restored: list[str] = []
+    removed_untracked: list[str] = []
+    errors: list[dict[str, str | int]] = []
+    worktree_root = worktree.resolve()
+
+    for rel_path in sorted(set(paths)):
+        target = (worktree / rel_path).resolve()
+        try:
+            target.relative_to(worktree_root)
+        except ValueError:
+            errors.append({"path": rel_path, "error": "path escapes worktree"})
+            continue
+
+        tracked = run(["git", "ls-files", "--error-unmatch", "--", rel_path], worktree, timeout=120)
+        if tracked.returncode == 0:
+            restore = run(
+                ["git", "restore", "--source=HEAD", "--staged", "--worktree", "--", rel_path],
+                worktree,
+                timeout=120,
+            )
+            if restore.returncode == 0:
+                restored.append(rel_path)
+            else:
+                errors.append(
+                    {
+                        "path": rel_path,
+                        "returncode": restore.returncode,
+                        "error": restore.stderr[-1000:],
+                    }
+                )
+            continue
+
+        run(["git", "reset", "--", rel_path], worktree, timeout=120)
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            removed_untracked.append(rel_path)
+        except Exception as exc:
+            errors.append({"path": rel_path, "error": str(exc)})
+
+    remaining = forbidden_agent_edits(git_changed_files(worktree))
+    return {
+        "restored_tracked": restored,
+        "removed_untracked": removed_untracked,
+        "errors": errors,
+        "remaining_forbidden_files": remaining,
+        "clean": not remaining and not errors,
+    }
 
 
 def prompt_files(out_dir: Path, case: dict, group: str) -> tuple[Path, Path]:
@@ -885,6 +953,16 @@ def run_generic_agent_once(
         env=env,
     )
     timed_out = False
+    watchdog_fired = False
+
+    def watchdog_kill() -> None:
+        nonlocal watchdog_fired
+        watchdog_fired = True
+        terminate_process_group(proc.pid)
+
+    watchdog = threading.Timer(timeout_s + 60, watchdog_kill)
+    watchdog.daemon = True
+    watchdog.start()
     try:
         stdout, stderr = proc.communicate(timeout=timeout_s + 60)
         wrapper_returncode = int(proc.returncode) if proc.returncode is not None else 0
@@ -894,6 +972,12 @@ def run_generic_agent_once(
         wrapper_returncode = 124
         stdout = ""
         stderr = f"[generic_agent_timeout] timeout_s={timeout_s} runner={runner_script}\n"
+    finally:
+        watchdog.cancel()
+    if watchdog_fired and wrapper_returncode == 0:
+        timed_out = True
+        wrapper_returncode = 124
+        stderr = (stderr or "") + f"\n[generic_agent_watchdog_timeout] timeout_s={timeout_s} runner={runner_script}\n"
 
     post_status = run(["git", "status", "--porcelain=v1", "-uno"], repo, timeout=120)
     post_diff = run(["git", "diff"], repo, timeout=120)
@@ -950,7 +1034,20 @@ def run_generic_agent(
     started = time.time()
     attempts = []
     payload: dict = {}
+    retry_reset_available = not git_status_short(repo).strip()
+    timeout_retries_used = 0
     for attempt in range(1, infra_retries + 2):
+        retry_reset = None
+        if attempt > 1 and retry_reset_available:
+            reset = run(["git", "reset", "--hard", "HEAD"], repo, timeout=300)
+            clean = run(["git", "clean", "-fd"], repo, timeout=300)
+            retry_reset = {
+                "reset_returncode": reset.returncode,
+                "clean_returncode": clean.returncode,
+                "status_after": git_status_short(repo),
+            }
+        if out_json.exists():
+            out_json.unlink()
         payload = run_generic_agent_once(
             repo,
             system,
@@ -974,15 +1071,19 @@ def run_generic_agent(
                 "elapsed_s": payload.get("elapsed_s"),
                 "infra_failure": is_generic_infra_failure(payload),
                 "error_summary": agent_error_text(payload),
+                "retry_reset": retry_reset,
             }
         )
         if not payload.get("timed_out") and payload.get("returncode") == 0:
             break
         if is_generic_infra_failure(payload) and not is_retryable_generic_infra_failure(payload):
             break
-        if is_retryable_generic_infra_failure(payload) and attempt <= infra_retries:
+        if payload.get("timed_out"):
+            if timeout_retries_used >= 1 or attempt > infra_retries:
+                break
+            timeout_retries_used += 1
             time.sleep(min(30 * attempt, 90))
-        elif attempt <= infra_retries and payload.get("timed_out"):
+        elif is_retryable_generic_infra_failure(payload) and attempt <= infra_retries:
             time.sleep(min(30 * attempt, 90))
         elif attempt <= infra_retries:
             time.sleep(min(10 * attempt, 30))
@@ -1069,6 +1170,7 @@ def evaluate_case_group(case: dict, group: str, args: argparse.Namespace, repos_
     agent_diff = ""
     changed_files: list[str] = []
     forbidden_files: list[str] = []
+    forbidden_restore = None
 
     if result_path.exists() and not args.force:
         existing = json.loads(result_path.read_text(encoding="utf-8"))
@@ -1096,16 +1198,17 @@ def evaluate_case_group(case: dict, group: str, args: argparse.Namespace, repos_
         forbidden_files = forbidden_agent_edits(changed_files)
         (out_dir / "agent.patch").write_text(agent_diff, encoding="utf-8")
 
-        if not agent_completed_successfully({"agent": agent}):
+        if args.forbid_forbidden_edits and forbidden_files:
+            forbidden_restore = restore_forbidden_agent_edits(worktree, forbidden_files)
             eval_result = {
-                "status": "agent_failed_or_timed_out",
+                "status": "agent_modified_forbidden_files",
                 "solved": False,
                 "strict_solved": False,
                 "target_solved": False,
+                "forbidden_files": forbidden_files,
                 "changed_files": changed_files,
-                "agent_returncode": agent.get("returncode"),
-                "agent_timed_out": agent.get("timed_out"),
-                "agent_error_summary": agent_error_text(agent.get("raw") or {}),
+                "forbidden_patterns": FORBIDDEN_AGENT_EDIT_PATTERNS,
+                "forbidden_restore": forbidden_restore,
             }
             result = {
                 "case_id": case_id,
@@ -1129,19 +1232,21 @@ def evaluate_case_group(case: dict, group: str, args: argparse.Namespace, repos_
                 "agent_patch_size": len(agent_diff),
                 "agent_changed_files": changed_files,
                 "agent_forbidden_files": forbidden_files,
+                "forbidden_restore": forbidden_restore,
                 "evaluation": eval_result,
             }
             return result
 
-        if args.forbid_forbidden_edits and forbidden_files:
+        if not agent_completed_successfully({"agent": agent}):
             eval_result = {
-                "status": "agent_modified_forbidden_files",
+                "status": "agent_failed_or_timed_out",
                 "solved": False,
                 "strict_solved": False,
                 "target_solved": False,
-                "forbidden_files": forbidden_files,
                 "changed_files": changed_files,
-                "forbidden_patterns": FORBIDDEN_AGENT_EDIT_PATTERNS,
+                "agent_returncode": agent.get("returncode"),
+                "agent_timed_out": agent.get("timed_out"),
+                "agent_error_summary": agent_error_text(agent.get("raw") or {}),
             }
             result = {
                 "case_id": case_id,
@@ -1224,11 +1329,22 @@ def evaluate_case_group(case: dict, group: str, args: argparse.Namespace, repos_
                 target_solved, strict_solved = strict_eval_solved(
                     fail_to_pass, pass_to_pass, args.require_pass_to_pass
                 )
+                if int(fail_to_pass.get("total") or 0) == 0:
+                    evaluation_status = "harness_target_not_executed"
+                elif (
+                    args.require_pass_to_pass
+                    and p2p_tests
+                    and (pass_to_pass is None or int(pass_to_pass.get("total") or 0) == 0)
+                ):
+                    evaluation_status = "harness_pass_to_pass_not_executed"
+                else:
+                    evaluation_status = "completed"
                 eval_result = {
-                    "status": "completed",
+                    "status": evaluation_status,
                     "solved": strict_solved,
                     "strict_solved": strict_solved,
                     "target_solved": target_solved,
+                    "harness_issue": evaluation_status.startswith("harness_"),
                     "fail_to_pass": fail_to_pass,
                     "pass_to_pass": pass_to_pass,
                     "runnable_fail_to_pass": runnable_tests,
@@ -1248,11 +1364,22 @@ def evaluate_case_group(case: dict, group: str, args: argparse.Namespace, repos_
             target_solved, strict_solved = strict_eval_solved(
                 fail_to_pass, pass_to_pass, args.require_pass_to_pass
             )
+            if int(fail_to_pass.get("total") or 0) == 0:
+                evaluation_status = "harness_target_not_executed"
+            elif (
+                args.require_pass_to_pass
+                and p2p_tests
+                and (pass_to_pass is None or int(pass_to_pass.get("total") or 0) == 0)
+            ):
+                evaluation_status = "harness_pass_to_pass_not_executed"
+            else:
+                evaluation_status = "completed"
             eval_result = {
-                "status": "completed",
+                "status": evaluation_status,
                 "solved": strict_solved,
                 "strict_solved": strict_solved,
                 "target_solved": target_solved,
+                "harness_issue": evaluation_status.startswith("harness_"),
                 "fail_to_pass": fail_to_pass,
                 "pass_to_pass": pass_to_pass,
                 "runnable_fail_to_pass": runnable_tests,
@@ -1283,8 +1410,38 @@ def evaluate_case_group(case: dict, group: str, args: argparse.Namespace, repos_
             "agent_forbidden_files": forbidden_files,
             "evaluation": eval_result,
         }
-    except InfrastructureError:
-        raise
+    except InfrastructureError as exc:
+        result = {
+            "case_id": case_id,
+            "group": group,
+            "repo": repo,
+            "source_dataset": case.get("source_dataset"),
+            "A_instance_id": case.get("A_instance_id"),
+            "B_instance_id": case.get("B_instance_id"),
+            "worktree": str(worktree),
+            "setup": {
+                "ref": ref,
+                "injected_apply": injected_apply,
+                "b_baseline": b_baseline,
+                "test_patch_apply": test_patch_apply,
+                "pre_agent_git_status": pre_agent_git_status,
+                "pre_agent_git_diff_size": pre_agent_git_diff_size,
+                "pre_agent_head_parents": pre_agent_head_parents,
+            },
+            "agent": agent,
+            "agent_patch_path": str(out_dir / "agent.patch"),
+            "agent_patch_size": len(agent_diff),
+            "agent_changed_files": changed_files,
+            "agent_forbidden_files": forbidden_files,
+            "error": str(exc),
+            "evaluation": {
+                "status": "agent_infra_blocked",
+                "solved": False,
+                "strict_solved": False,
+                "target_solved": False,
+                "harness_issue": True,
+            },
+        }
     except Exception as exc:
         result = {
             "case_id": case_id,

@@ -10,6 +10,7 @@ build/
 
 # Virtual environments
 .venv/
+.venvs/
 venv/
 env/
 
@@ -30,6 +31,10 @@ htmlcov/
 # PR-Injector workspace (cloned repos, worktrees)
 .pri-workspace/
 .product-workspace/
+.external/
+.github-push-work/
+tmp/
+
 # Generated benchmark data
 benchmark_dataset/
 
@@ -37,9 +42,11 @@ benchmark_dataset/
 *.diff
 
 # Logs
+logs/
 *.log
 *.jsonl
 paper/
+paper writing/
 experiments/
 
 # OS

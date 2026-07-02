@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}"
+cd /Users/harmin/Desktop/pr-injector-main
 
 FINAL_DIR="experiments/rq2_100/rq2_b_l1_l2_original_100_final_20260605"
 PAIRING="${FINAL_DIR}/rq2_pairing_table.jsonl"
@@ -11,7 +10,7 @@ WORKTREES_DIR=".pri-workspace/rq2-sonnet46-b-fixed-harness-worktrees"
 MODEL="arn:aws:bedrock:us-west-2:497589205881:inference-profile/global.anthropic.claude-sonnet-4-6"
 LOG_DIR="experiments/rq2_100/logs"
 LOG_FILE="${LOG_DIR}/rq2_sonnet46_b_fixed_harness_20260606.log"
-BUNDLED_PYTHON="${BUNDLED_PYTHON:-python3}"
+BUNDLED_PYTHON="/Users/harmin/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3"
 PYTHON_BIN="${PYTHON_BIN:-${BUNDLED_PYTHON}}"
 export RQ2_CLAUDE_WRAPPER_PYTHON="${RQ2_CLAUDE_WRAPPER_PYTHON:-${BUNDLED_PYTHON}}"
 export PYTHONDONTWRITEBYTECODE=1

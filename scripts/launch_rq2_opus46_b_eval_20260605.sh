@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "${ROOT}"
+cd /Users/harmin/Desktop/pr-injector-main
 
 FINAL_DIR="experiments/rq2_100/rq2_b_l1_l2_original_100_final_20260605"
 PAIRING="${FINAL_DIR}/rq2_pairing_table.jsonl"
