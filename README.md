@@ -2,6 +2,19 @@
 
 > **Reusable construction release:** Start with [construction_toolkit/README.md](construction_toolkit/README.md). It separates the current bug-transplant and feature-addition case-construction workflows, strict gates, tests, and optional Agent Maestro adapters. Benchmark data and agent-evaluation results are intentionally excluded.
 
+## Compatibility workflows
+
+The reusable construction toolkit is additive. Existing repository-specific and
+experiment-compatible entry points remain available under `scripts/` so current
+integrations can migrate independently instead of being overwritten by the new
+toolkit layout.
+
+In particular, `scripts/experiment_ado.py` remains the stable Azure DevOps/C#
+entry point used by ProdBench. The newer bug-transplant implementation lives
+under `construction_toolkit/bug_transplant/`; neither workflow imports or
+silently falls back to the other. Changes to either contract should be validated
+against its own tests and consumers.
+
 PR-Injector is a framework that transplants real historical bug-fix commits onto the latest healthy codebase via a multi-level reversion strategy, producing faithful benchmark instances without per-instance environments.
 
 ## Three-Stage Pipeline
