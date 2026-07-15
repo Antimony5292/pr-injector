@@ -22,6 +22,10 @@ env/
 
 # Environment (contains secrets)
 .env
+*.pem
+*.key
+*secret*.toml
+*credentials*.json
 
 # Testing
 .coverage
@@ -37,6 +41,11 @@ tmp/
 
 # Generated benchmark data
 benchmark_dataset/
+artifacts/
+outputs/
+worktrees/
+repo_cache/
+.pri-workspace/
 
 # Extracted diff files (debugging artifacts)
 *.diff

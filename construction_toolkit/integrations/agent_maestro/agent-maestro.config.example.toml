@@ -1,0 +1,19 @@
+model = "gpt-5.3-codex"
+model_provider = "agent-maestro"
+
+[model_providers.agent-maestro]
+name = "Agent Maestro OpenAI Responses endpoint"
+base_url = "http://127.0.0.1:23334/api/openai/v1"
+wire_api = "responses"
+request_max_retries = 4
+stream_max_retries = 5
+stream_idle_timeout_ms = 300000
+
+[model_providers.agent-maestro.auth]
+command = "/bin/sh"
+args = [
+  "-lc",
+  "printf %s \"$AGENT_MAESTRO_API_KEY\"",
+]
+timeout_ms = 5000
+refresh_interval_ms = 0

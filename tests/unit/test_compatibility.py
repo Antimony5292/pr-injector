@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import ast
 
-from scripts.inject_swebench_pro import _extract_functions
+from construction_toolkit.bug_transplant.scripts.inject_swebench_pro import _extract_functions
 
 from pr_injector.core.compatibility import check_python_source_compatibility
 
