@@ -1,10 +1,11 @@
+import os
 from pathlib import Path
 
 from construction_toolkit.bug_transplant.scripts.inject_swebench_pro import coerce_list
 from construction_toolkit.bug_transplant.scripts.verify_swebench_pro import (
     _coerce_list,
-    _pytest_config_args,
     _patchlevel_runtime_compatible,
+    _pytest_config_args,
     _worktree_relative_nodeid,
 )
 
@@ -63,7 +64,7 @@ def test_invalid_scalar_pytest_testpaths_uses_explicit_config_override(tmp_path:
         '[tool.pytest.ini_options]\ntestpaths = "tests"\n', encoding="utf-8"
     )
 
-    assert _pytest_config_args(tmp_path) == ["-c", "/dev/null"]
+    assert _pytest_config_args(tmp_path) == ["-c", os.devnull]
 
 
 def test_patchlevel_runtime_tolerance_is_narrow() -> None:

@@ -163,9 +163,11 @@ def modern_path_candidates(historical_path: str, worktree: Path) -> list[str]:
     """Resolve common source-layout drift without guessing semantic edits."""
     direct_candidates = [worktree / historical_path, worktree / "src" / historical_path]
     direct = [
-        str(path.relative_to(worktree))
+        path.relative_to(worktree).as_posix()
         for path in direct_candidates
-        if path.exists() and path.is_file() and is_implementation_path(str(path.relative_to(worktree)))
+        if path.exists()
+        and path.is_file()
+        and is_implementation_path(path.relative_to(worktree).as_posix())
     ]
     if direct:
         return list(dict.fromkeys(direct))
@@ -184,7 +186,7 @@ def modern_path_candidates(historical_path: str, worktree: Path) -> list[str]:
     for path in candidates:
         if not path.exists() or not path.is_file():
             continue
-        rel = str(path.relative_to(worktree))
+        rel = path.relative_to(worktree).as_posix()
         if is_implementation_path(rel) and rel not in out:
             out.append(rel)
     return out
